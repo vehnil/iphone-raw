@@ -13,6 +13,7 @@ struct DevelopSettings: Equatable {
     var saturation: Float = 1
     var appleLook = false
     var lensCorrection = false
+    var film: FilmLook?
 }
 
 enum RawRenderer {
@@ -84,6 +85,10 @@ enum RawRenderer {
             controls.inputImage = image
             controls.saturation = settings.saturation
             image = controls.outputImage ?? image
+        }
+
+        if let film = settings.film {
+            image = FilmPipeline.apply(film, to: image)
         }
 
         guard let cgImage = context.createCGImage(image, from: image.extent) else { return nil }
