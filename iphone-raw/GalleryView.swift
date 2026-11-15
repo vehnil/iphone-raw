@@ -4,6 +4,10 @@ struct GalleryView: View {
     @StateObject private var library = PhotoLibrary()
     @Environment(\.dismiss) private var dismiss
 
+    @State private var isSelecting = false
+    @State private var selection: Set<URL> = []
+    @State private var confirmingDelete = false
+
     private let columns = [GridItem(.adaptive(minimum: 110), spacing: 2)]
 
     var body: some View {
@@ -15,30 +19,108 @@ struct GalleryView: View {
                     ScrollView {
                         LazyVGrid(columns: columns, spacing: 2) {
                             ForEach(library.photos, id: \.self) { url in
-                                NavigationLink(value: url) {
-                                    Thumbnail(url: url)
-                                }
-                                .contextMenu {
-                                    ShareLink(item: url)
-                                    Button("Delete", systemImage: "trash", role: .destructive) {
-                                        library.delete(url)
-                                    }
-                                }
+                                cell(for: url)
                             }
                         }
                     }
                 }
             }
-            .navigationTitle("Photos")
+            .navigationTitle(isSelecting ? selectionTitle : "Photos")
             .navigationBarTitleDisplayMode(.inline)
             .navigationDestination(for: URL.self) { PhotoDetailView(url: $0) }
-            .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Done") { dismiss() }
+            .toolbar { toolbar }
+            .confirmationDialog(deleteTitle, isPresented: $confirmingDelete, titleVisibility: .visible) {
+                Button("Delete", role: .destructive) {
+                    library.delete(selection)
+                    endSelecting()
                 }
+            } message: {
+                Text("Copies already saved to Photos are not affected.")
             }
             .onAppear { library.refresh() }
         }
+    }
+
+    @ViewBuilder
+    private func cell(for url: URL) -> some View {
+        if isSelecting {
+            Button { toggle(url) } label: {
+                Thumbnail(url: url)
+                    .overlay(alignment: .bottomTrailing) {
+                        SelectionMark(isSelected: selection.contains(url))
+                    }
+                    .opacity(selection.contains(url) ? 0.7 : 1)
+            }
+            .buttonStyle(.plain)
+        } else {
+            NavigationLink(value: url) {
+                Thumbnail(url: url)
+            }
+            .contextMenu {
+                ShareLink(item: url)
+                Button("Select", systemImage: "checkmark.circle") {
+                    isSelecting = true
+                    selection = [url]
+                }
+                Button("Delete", systemImage: "trash", role: .destructive) {
+                    library.delete([url])
+                }
+            }
+        }
+    }
+
+    @ToolbarContentBuilder
+    private var toolbar: some ToolbarContent {
+        if isSelecting {
+            ToolbarItem(placement: .topBarLeading) {
+                Button(selection.count == library.photos.count ? "Deselect All" : "Select All") {
+                    selection = selection.count == library.photos.count ? [] : Set(library.photos)
+                }
+            }
+            ToolbarItem(placement: .confirmationAction) {
+                Button("Cancel") { endSelecting() }
+            }
+            ToolbarItemGroup(placement: .bottomBar) {
+                ShareLink(items: Array(selection)) {
+                    Image(systemName: "square.and.arrow.up")
+                }
+                .disabled(selection.isEmpty)
+                Spacer()
+                Button(role: .destructive) { confirmingDelete = true } label: {
+                    Image(systemName: "trash")
+                }
+                .disabled(selection.isEmpty)
+            }
+        } else {
+            ToolbarItem(placement: .topBarLeading) {
+                Button("Select") { isSelecting = true }
+                    .disabled(library.photos.isEmpty)
+            }
+            ToolbarItem(placement: .confirmationAction) {
+                Button("Done") { dismiss() }
+            }
+        }
+    }
+
+    private var selectionTitle: String {
+        selection.isEmpty ? "Select Items" : "\(selection.count) Selected"
+    }
+
+    private var deleteTitle: String {
+        selection.count == 1 ? "Delete 1 photo?" : "Delete \(selection.count) photos?"
+    }
+
+    private func toggle(_ url: URL) {
+        if selection.contains(url) {
+            selection.remove(url)
+        } else {
+            selection.insert(url)
+        }
+    }
+
+    private func endSelecting() {
+        isSelecting = false
+        selection = []
     }
 }
 
@@ -56,5 +138,17 @@ private struct Thumbnail: View {
             }
             .clipped()
             .task { image = await RawRenderer.thumbnail(for: url) }
+    }
+}
+
+private struct SelectionMark: View {
+    let isSelected: Bool
+
+    var body: some View {
+        Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+            .font(.title3)
+            .symbolRenderingMode(.palette)
+            .foregroundStyle(.white, isSelected ? Color.accentColor : .black.opacity(0.3))
+            .padding(6)
     }
 }

@@ -13,8 +13,10 @@ final class PhotoLibrary: ObservableObject {
     }
 
     /// Removes the app's copy only; the one in Photos is untouched.
-    func delete(_ url: URL) {
-        try? FileManager.default.removeItem(at: url)
+    func delete(_ urls: some Collection<URL>) {
+        for url in urls {
+            try? FileManager.default.removeItem(at: url)
+        }
         refresh()
     }
 }
