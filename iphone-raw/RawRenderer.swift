@@ -29,6 +29,22 @@ struct DevelopSettings: Codable, Equatable {
     var filmPresetID: String?
 }
 
+extension DevelopSettings {
+    /// Missing keys fall back to defaults, so saved edits survive new settings being added.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let d = DevelopSettings()
+        exposure = try c.decodeIfPresent(Float.self, forKey: .exposure) ?? d.exposure
+        temperature = try c.decodeIfPresent(Float.self, forKey: .temperature)
+        tint = try c.decodeIfPresent(Float.self, forKey: .tint)
+        saturation = try c.decodeIfPresent(Float.self, forKey: .saturation) ?? d.saturation
+        appleLook = try c.decodeIfPresent(Bool.self, forKey: .appleLook) ?? d.appleLook
+        lensCorrection = try c.decodeIfPresent(Bool.self, forKey: .lensCorrection) ?? d.lensCorrection
+        film = try c.decodeIfPresent(FilmLook.self, forKey: .film)
+        filmPresetID = try c.decodeIfPresent(String.self, forKey: .filmPresetID)
+    }
+}
+
 enum RawRenderer {
     enum Priority {
         /// Grid thumbnails and look previews.

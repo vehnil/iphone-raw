@@ -159,6 +159,8 @@ extension CameraController: AVCapturePhotoCaptureDelegate {
             publish { $0.status = "Couldn't write \(name): \(error.localizedDescription)" }
             return
         }
+        // On main, like the gallery's edits, so the two never write the archive at once.
+        DispatchQueue.main.async { EditArchive.startNewPhoto(named: name) }
 
         Task {
             guard await PHPhotoLibrary.requestAuthorization(for: .addOnly) == .authorized else {

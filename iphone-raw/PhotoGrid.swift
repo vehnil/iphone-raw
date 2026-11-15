@@ -27,6 +27,7 @@ struct PhotoGrid: View {
         .confirmationDialog(deleteTitle, isPresented: $confirmingDelete, titleVisibility: .visible) {
             Button("Delete", role: .destructive) {
                 library.delete(selection)
+                edits.forget(selection)
                 endSelecting()
             }
         } message: {
@@ -57,6 +58,7 @@ struct PhotoGrid: View {
                     }
                     Button("Delete", systemImage: "trash", role: .destructive) {
                         library.delete([url])
+                        edits.forget([url])
                     }
                 }
         }
