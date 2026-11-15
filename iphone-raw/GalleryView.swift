@@ -1,154 +1,43 @@
 import SwiftUI
 
+/// Opens on the most recent photo; swipe right for older ones, or switch to the grid.
 struct GalleryView: View {
     @StateObject private var library = PhotoLibrary()
+    @StateObject private var edits = EditStore()
     @Environment(\.dismiss) private var dismiss
 
-    @State private var isSelecting = false
-    @State private var selection: Set<URL> = []
-    @State private var confirmingDelete = false
-
-    private let columns = [GridItem(.adaptive(minimum: 110), spacing: 2)]
+    @State private var showingGrid = false
+    @State private var current: URL?
 
     var body: some View {
         NavigationStack {
             Group {
                 if library.photos.isEmpty {
                     ContentUnavailableView("No photos yet", systemImage: "camera", description: Text("RAW captures from this app show up here."))
-                } else {
-                    ScrollView {
-                        LazyVGrid(columns: columns, spacing: 2) {
-                            ForEach(library.photos, id: \.self) { url in
-                                cell(for: url)
+                        .toolbar {
+                            ToolbarItem(placement: .confirmationAction) {
+                                Button("Done") { dismiss() }
                             }
                         }
-                    }
+                } else if showingGrid {
+                    PhotoGrid(library: library, edits: edits, onOpen: { url in
+                        current = url
+                        showingGrid = false
+                    }, onDone: { dismiss() })
+                } else {
+                    PhotoViewer(photos: library.photos, current: $current, edits: edits,
+                                onShowGrid: { showingGrid = true }, onDone: { dismiss() })
                 }
             }
-            .navigationTitle(isSelecting ? selectionTitle : "Photos")
             .navigationBarTitleDisplayMode(.inline)
-            .navigationDestination(for: URL.self) { PhotoDetailView(url: $0) }
-            .toolbar { toolbar }
-            .confirmationDialog(deleteTitle, isPresented: $confirmingDelete, titleVisibility: .visible) {
-                Button("Delete", role: .destructive) {
-                    library.delete(selection)
-                    endSelecting()
-                }
-            } message: {
-                Text("Copies already saved to Photos are not affected.")
-            }
-            .onAppear { library.refresh() }
         }
-    }
-
-    @ViewBuilder
-    private func cell(for url: URL) -> some View {
-        if isSelecting {
-            Button { toggle(url) } label: {
-                Thumbnail(url: url)
-                    .overlay(alignment: .bottomTrailing) {
-                        SelectionMark(isSelected: selection.contains(url))
-                    }
-                    .opacity(selection.contains(url) ? 0.7 : 1)
-            }
-            .buttonStyle(.plain)
-        } else {
-            NavigationLink(value: url) {
-                Thumbnail(url: url)
-            }
-            .contextMenu {
-                ShareLink(item: url)
-                Button("Select", systemImage: "checkmark.circle") {
-                    isSelecting = true
-                    selection = [url]
-                }
-                Button("Delete", systemImage: "trash", role: .destructive) {
-                    library.delete([url])
-                }
-            }
+        .onAppear {
+            library.refresh()
+            current = library.photos.last
         }
-    }
-
-    @ToolbarContentBuilder
-    private var toolbar: some ToolbarContent {
-        if isSelecting {
-            ToolbarItem(placement: .topBarLeading) {
-                Button(selection.count == library.photos.count ? "Deselect All" : "Select All") {
-                    selection = selection.count == library.photos.count ? [] : Set(library.photos)
-                }
-            }
-            ToolbarItem(placement: .confirmationAction) {
-                Button("Cancel") { endSelecting() }
-            }
-            ToolbarItemGroup(placement: .bottomBar) {
-                ShareLink(items: Array(selection)) {
-                    Image(systemName: "square.and.arrow.up")
-                }
-                .disabled(selection.isEmpty)
-                Spacer()
-                Button(role: .destructive) { confirmingDelete = true } label: {
-                    Image(systemName: "trash")
-                }
-                .disabled(selection.isEmpty)
-            }
-        } else {
-            ToolbarItem(placement: .topBarLeading) {
-                Button("Select") { isSelecting = true }
-                    .disabled(library.photos.isEmpty)
-            }
-            ToolbarItem(placement: .confirmationAction) {
-                Button("Done") { dismiss() }
-            }
+        .onChange(of: library.photos) { _, photos in
+            if let current, photos.contains(current) { return }
+            current = photos.last
         }
-    }
-
-    private var selectionTitle: String {
-        selection.isEmpty ? "Select Items" : "\(selection.count) Selected"
-    }
-
-    private var deleteTitle: String {
-        selection.count == 1 ? "Delete 1 photo?" : "Delete \(selection.count) photos?"
-    }
-
-    private func toggle(_ url: URL) {
-        if selection.contains(url) {
-            selection.remove(url)
-        } else {
-            selection.insert(url)
-        }
-    }
-
-    private func endSelecting() {
-        isSelecting = false
-        selection = []
-    }
-}
-
-private struct Thumbnail: View {
-    let url: URL
-    @State private var image: UIImage?
-
-    var body: some View {
-        Color.gray.opacity(0.2)
-            .aspectRatio(1, contentMode: .fit)
-            .overlay {
-                if let image {
-                    Image(uiImage: image).resizable().scaledToFill()
-                }
-            }
-            .clipped()
-            .task { image = await RawRenderer.thumbnail(for: url) }
-    }
-}
-
-private struct SelectionMark: View {
-    let isSelected: Bool
-
-    var body: some View {
-        Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
-            .font(.title3)
-            .symbolRenderingMode(.palette)
-            .foregroundStyle(.white, isSelected ? Color.accentColor : .black.opacity(0.3))
-            .padding(6)
     }
 }

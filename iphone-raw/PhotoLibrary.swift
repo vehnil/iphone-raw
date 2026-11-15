@@ -1,6 +1,6 @@
 import Foundation
 
-/// The DNGs this app has saved to its Documents folder, newest first.
+/// The DNGs this app has saved to its Documents folder, oldest first.
 final class PhotoLibrary: ObservableObject {
     @Published private(set) var photos: [URL] = []
 
@@ -9,7 +9,7 @@ final class PhotoLibrary: ObservableObject {
         // File names are timestamps, so sorting by name sorts by capture time.
         photos = contents
             .filter { $0.pathExtension.lowercased() == "dng" }
-            .sorted { $0.lastPathComponent > $1.lastPathComponent }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
     }
 
     /// Removes the app's copy only; the one in Photos is untouched.
@@ -18,5 +18,17 @@ final class PhotoLibrary: ObservableObject {
             try? FileManager.default.removeItem(at: url)
         }
         refresh()
+    }
+
+    private static let nameFormat: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "'RAW_'yyyyMMdd_HHmmss"
+        return formatter
+    }()
+
+    /// Capture time, from the file name.
+    static func captureDate(of url: URL) -> Date? {
+        nameFormat.date(from: url.deletingPathExtension().lastPathComponent)
     }
 }

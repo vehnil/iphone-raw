@@ -5,7 +5,7 @@ import UIKit
 /// User-adjustable development of a Bayer DNG. The defaults are "neutral":
 /// none of Apple's look (boost, local tone mapping, sharpening, noise
 /// reduction, lens correction) is applied.
-struct DevelopSettings: Equatable {
+struct DevelopSettings: Codable, Equatable {
     var exposure: Float = 0
     /// Kelvin. `nil` means the as-shot white balance stored in the DNG.
     var temperature: Float?
@@ -14,11 +14,20 @@ struct DevelopSettings: Equatable {
     var appleLook = false
     var lensCorrection = false
     var film: FilmLook?
+    /// The preset `film` started from, for highlighting it in the UI.
+    var filmPresetID: String?
 }
 
 enum RawRenderer {
+    enum Priority {
+        /// Grid thumbnails and look previews.
+        case thumbnail
+        /// The photo being viewed.
+        case preview
+    }
+
     private static let context = CIContext()
-    private static let thumbnails = NSCache<NSURL, UIImage>()
+    private static let thumbnails = NSCache<NSString, UIImage>()
 
     // RAW decodes block their thread until done. Run on Swift's cooperative
     // pool (one thread per core), a gallery's worth of them occupies every
@@ -36,25 +45,36 @@ enum RawRenderer {
         }
     }
 
-    static func thumbnail(for url: URL) async -> UIImage? {
-        if let cached = thumbnails.object(forKey: url as NSURL) { return cached }
-        let image = await run(on: thumbnailQueue) {
-            renderSync(url, settings: DevelopSettings(), maxPixel: 400)
-        }
-        if let image { thumbnails.setObject(image, forKey: url as NSURL) }
+    static func thumbnail(for url: URL, settings: DevelopSettings = DevelopSettings()) async -> UIImage? {
+        let key = cacheKey(url, settings)
+        if let cached = thumbnails.object(forKey: key) { return cached }
+        let image = await render(url, settings: settings, maxPixel: 400, priority: .thumbnail)
+        if let image { thumbnails.setObject(image, forKey: key) }
         return image
     }
 
-    static func render(_ url: URL, settings: DevelopSettings, maxPixel: CGFloat) async -> UIImage? {
-        await run(on: previewQueue) {
+    static func render(_ url: URL, settings: DevelopSettings, maxPixel: CGFloat, priority: Priority = .preview) async -> UIImage? {
+        await run(on: priority == .preview ? previewQueue : thumbnailQueue) {
             renderSync(url, settings: settings, maxPixel: maxPixel)
         }
     }
 
-    private static func run<T>(on queue: DispatchQueue, _ work: @escaping () -> T) async -> T {
-        await withCheckedContinuation { continuation in
-            queue.async { continuation.resume(returning: work()) }
+    /// Runs `work` on `queue`, skipping it if the calling task was cancelled
+    /// while waiting — e.g. a page swiped past before its turn came.
+    private static func run<T>(on queue: DispatchQueue, _ work: @escaping () -> T?) async -> T? {
+        let cancelled = CancellationFlag()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                queue.async { continuation.resume(returning: cancelled.isSet ? nil : work()) }
+            }
+        } onCancel: {
+            cancelled.set()
         }
+    }
+
+    private static func cacheKey(_ url: URL, _ settings: DevelopSettings) -> NSString {
+        let encoded = (try? JSONEncoder().encode(settings)).map { String(decoding: $0, as: UTF8.self) } ?? ""
+        return "\(url.lastPathComponent)|\(encoded)" as NSString
     }
 
     private static func renderSync(_ url: URL, settings: DevelopSettings, maxPixel: CGFloat) -> UIImage? {
@@ -101,4 +121,12 @@ enum RawRenderer {
     private static func grainSeed(for url: URL) -> UInt64 {
         url.lastPathComponent.utf8.reduce(14695981039346656037) { ($0 ^ UInt64($1)) &* 1099511628211 }
     }
+}
+
+private final class CancellationFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = false
+
+    var isSet: Bool { lock.withLock { value } }
+    func set() { lock.withLock { value = true } }
 }
