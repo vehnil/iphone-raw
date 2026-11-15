@@ -16,6 +16,7 @@ final class PhotoLibrary: ObservableObject {
     func delete(_ urls: some Collection<URL>) {
         for url in urls {
             try? FileManager.default.removeItem(at: url)
+            RawRenderer.removeCachedThumbnails(for: url)
         }
         refresh()
     }

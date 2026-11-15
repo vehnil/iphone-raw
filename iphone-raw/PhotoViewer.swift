@@ -10,6 +10,8 @@ struct PhotoViewer: View {
     let onDone: () -> Void
 
     @State private var showingEditor = false
+    /// The photo under the filmstrip's centre while scrubbing; the pager only moves when scrubbing ends.
+    @State private var scrubbed: URL?
     @State private var isExporting = false
     @State private var message: String?
 
@@ -28,6 +30,11 @@ struct PhotoViewer: View {
             .scrollPosition(id: $current)
             .scrollIndicators(.hidden)
             .background(Color.black)
+            .overlay {
+                if let scrubbed {
+                    ScrubPreview(url: scrubbed, settings: edits.settings(for: scrubbed))
+                }
+            }
             .simultaneousGesture(editorSwipe)
 
             if showingEditor, let current {
@@ -36,7 +43,7 @@ struct PhotoViewer: View {
                     .background(.bar)
                     .transition(.move(edge: .bottom))
             } else {
-                Filmstrip(photos: photos, current: $current, edits: edits)
+                Filmstrip(photos: photos, current: $current, scrubbed: $scrubbed, edits: edits)
                     .padding(.vertical, 6)
             }
         }
@@ -133,7 +140,7 @@ struct PhotoViewer: View {
     }
 
     private var title: String {
-        guard let current, let date = PhotoLibrary.captureDate(of: current) else { return "" }
+        guard let shown = scrubbed ?? current, let date = PhotoLibrary.captureDate(of: shown) else { return "" }
         return date.formatted(date: .abbreviated, time: .shortened)
     }
 }
@@ -143,6 +150,13 @@ private struct PhotoPage: View {
     let url: URL
     let settings: DevelopSettings
     @State private var image: UIImage?
+
+    init(url: URL, settings: DevelopSettings) {
+        self.url = url
+        self.settings = settings
+        // Start from a cached thumbnail so landing on a page never flashes empty.
+        _image = State(initialValue: RawRenderer.cachedThumbnail(for: url, settings: settings))
+    }
     /// Set once a full render has landed, so a slower thumbnail can't replace it.
     @State private var hasFullRender = false
 
@@ -172,14 +186,16 @@ private struct PhotoPage: View {
 }
 
 /// Photos-style scrubber: narrow slices of every photo, with the current one
-/// centred and expanded to its real shape. Dragging updates the photo live as
-/// each slice crosses the centre; tapping jumps; swiping the photo moves the strip.
+/// expanded to its real shape. Every slice takes the same space in the layout
+/// (the expanded one is drawn on top), so the slice under the centre is always
+/// `offset / pitch` — exact even mid-fling. While scrubbing it reports that
+/// photo through `scrubbed`; letting go makes it `current`.
 private struct Filmstrip: View {
     let photos: [URL]
     @Binding var current: URL?
+    @Binding var scrubbed: URL?
     @ObservedObject var edits: EditStore
 
-    /// True while the user drags or flings the strip; the strip then drives `current`.
     @State private var isScrubbing = false
 
     static let height: CGFloat = 42
@@ -195,7 +211,7 @@ private struct Filmstrip: View {
                         ForEach(photos, id: \.self) { url in
                             let expanded = url == current && !isScrubbing
                             StripThumbnail(url: url, settings: edits.settings(for: url), expanded: expanded)
-                                .padding(.horizontal, expanded ? 6 : 0)
+                                .zIndex(expanded ? 1 : 0)
                                 .id(url)
                                 .onTapGesture { current = url }
                         }
@@ -207,21 +223,19 @@ private struct Filmstrip: View {
                 .scrollTargetBehavior(SliceSnapping(pitch: Self.pitch))
                 .onScrollPhaseChange { _, phase in
                     let scrubbing = phase == .tracking || phase == .interacting || phase == .decelerating
-                    if scrubbing != isScrubbing {
-                        withAnimation(.snappy) { isScrubbing = scrubbing }
-                    }
-                    if phase == .idle, let current {
-                        withAnimation(.snappy) { reader.scrollTo(current, anchor: .center) }
+                    guard scrubbing != isScrubbing else { return }
+                    withAnimation(.snappy(duration: 0.2)) { isScrubbing = scrubbing }
+                    if !scrubbing, let scrubbed {
+                        current = scrubbed
+                        self.scrubbed = nil
                     }
                 }
-                // While scrubbing every slice has the same width, so the slice
-                // under the centre is just the offset divided by the pitch.
                 .onScrollGeometryChange(for: Int.self) { geometry in
                     Int((geometry.contentOffset.x / Self.pitch).rounded())
                 } action: { _, index in
-                    guard isScrubbing else { return }
+                    guard isScrubbing, !photos.isEmpty else { return }
                     let url = photos[min(max(index, 0), photos.count - 1)]
-                    if url != current { current = url }
+                    if url != scrubbed { scrubbed = url }
                 }
                 .onChange(of: current) { _, url in
                     guard !isScrubbing, let url else { return }
@@ -233,7 +247,21 @@ private struct Filmstrip: View {
             }
         }
         .frame(height: Self.height)
-        .sensoryFeedback(.selection, trigger: current) { _, _ in isScrubbing }
+        .sensoryFeedback(.selection, trigger: scrubbed) { _, new in new != nil }
+        .task(id: current) { await prefetch(around: current) }
+    }
+
+    /// Warms thumbnails nearest the current photo first, so scrubbing finds them ready.
+    private func prefetch(around url: URL?) async {
+        guard let url, let center = photos.firstIndex(of: url) else { return }
+        let nearby = photos.indices
+            .sorted { abs($0 - center) < abs($1 - center) }
+            .prefix(40)
+        for index in nearby {
+            guard !Task.isCancelled else { return }
+            let photo = photos[index]
+            _ = await RawRenderer.thumbnail(for: photo, settings: edits.settings(for: photo))
+        }
     }
 }
 
@@ -252,13 +280,31 @@ private struct StripThumbnail: View {
     let expanded: Bool
     @State private var image: UIImage?
 
-    private var width: CGFloat {
-        guard expanded else { return Filmstrip.sliceWidth }
+    private var expandedWidth: CGFloat {
         let aspect = image.map { $0.size.width / $0.size.height } ?? 0.75
         return Filmstrip.height * aspect
     }
 
     var body: some View {
+        thumbnail(width: Filmstrip.sliceWidth)
+            .overlay {
+                if expanded {
+                    // Drawn over the neighbours; the black edge reads as a gap around it.
+                    thumbnail(width: expandedWidth)
+                        .padding(.horizontal, 3)
+                        .background(Color.black)
+                        .fixedSize()
+                        .transition(.opacity)
+                }
+            }
+            .task(id: settings) {
+                if let rendered = await RawRenderer.thumbnail(for: url, settings: settings) {
+                    image = rendered
+                }
+            }
+    }
+
+    private func thumbnail(width: CGFloat) -> some View {
         Color.gray.opacity(0.2)
             .overlay {
                 if let image {
@@ -267,10 +313,27 @@ private struct StripThumbnail: View {
             }
             .frame(width: width, height: Filmstrip.height)
             .clipShape(RoundedRectangle(cornerRadius: 2))
-            .task(id: settings) {
-                if let rendered = await RawRenderer.thumbnail(for: url, settings: settings) {
-                    image = rendered
-                }
+    }
+}
+
+/// What the photo area shows while scrubbing: the cached thumbnail, instantly.
+/// Keeps the previous photo up if the next one isn't cached yet, so it never flashes.
+private struct ScrubPreview: View {
+    let url: URL
+    let settings: DevelopSettings
+    @State private var loaded: UIImage?
+
+    var body: some View {
+        ZStack {
+            Color.black
+            if let image = RawRenderer.cachedThumbnail(for: url, settings: settings) ?? loaded {
+                Image(uiImage: image).resizable().scaledToFit()
             }
+        }
+        .task(id: url) {
+            if let image = await RawRenderer.thumbnail(for: url, settings: settings) {
+                loaded = image
+            }
+        }
     }
 }

@@ -54,7 +54,15 @@ enum RawRenderer {
     }
 
     private static let context = CIContext()
-    private static let thumbnails = NSCache<NSString, UIImage>()
+    private static let thumbnails: NSCache<NSString, UIImage> = {
+        let cache = NSCache<NSString, UIImage>()
+        cache.totalCostLimit = 96 << 20
+        return cache
+    }()
+    /// Rendered thumbnails persist here (one folder per photo) so they load instantly next time.
+    private static let thumbnailDirectory = URL.cachesDirectory.appending(path: "thumbnails")
+    /// Reading a cached JPEG is cheap and safe to do in parallel, unlike a RAW decode.
+    private static let diskQueue = DispatchQueue(label: "iphoneraw.thumbnails.disk", qos: .userInitiated, attributes: .concurrent)
 
     // RAW decodes block their thread until done. Run on Swift's cooperative
     // pool (one thread per core), a gallery's worth of them occupies every
@@ -72,12 +80,37 @@ enum RawRenderer {
         }
     }
 
+    /// A thumbnail already in memory, without waiting — for scrubbing.
+    static func cachedThumbnail(for url: URL, settings: DevelopSettings) -> UIImage? {
+        thumbnails.object(forKey: cacheKey(url, settings))
+    }
+
+    /// Memory, then disk, then a fresh (draft-quality) RAW decode.
     static func thumbnail(for url: URL, settings: DevelopSettings = DevelopSettings()) async -> UIImage? {
         let key = cacheKey(url, settings)
         if let cached = thumbnails.object(forKey: key) { return cached }
-        let image = await render(url, settings: settings, maxPixel: 400, priority: .thumbnail)
-        if let image { thumbnails.setObject(image, forKey: key) }
+
+        let file = thumbnailDirectory.appending(path: url.lastPathComponent).appending(path: "\(fnv1a(key as String)).jpg")
+        var image = await run(on: diskQueue) {
+            (try? Data(contentsOf: file)).flatMap(UIImage.init(data:))?.preparingForDisplay()
+        }
+        if image == nil {
+            image = await run(on: thumbnailQueue) {
+                renderSync(url, settings: settings, maxPixel: 400, draft: true)
+            }
+            if let data = image?.jpegData(compressionQuality: 0.85) {
+                try? FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try? data.write(to: file)
+            }
+        }
+        if let image {
+            thumbnails.setObject(image, forKey: key, cost: Int(image.size.width * image.size.height * image.scale * image.scale * 4))
+        }
         return image
+    }
+
+    static func removeCachedThumbnails(for url: URL) {
+        try? FileManager.default.removeItem(at: thumbnailDirectory.appending(path: url.lastPathComponent))
     }
 
     static func render(_ url: URL, settings: DevelopSettings, maxPixel: CGFloat, priority: Priority = .preview) async -> UIImage? {
@@ -104,8 +137,8 @@ enum RawRenderer {
         return "\(url.lastPathComponent)|\(encoded)" as NSString
     }
 
-    private static func renderSync(_ url: URL, settings: DevelopSettings, maxPixel: CGFloat) -> UIImage? {
-        renderCGImage(url, settings: settings, maxPixel: maxPixel).map(UIImage.init(cgImage:))
+    private static func renderSync(_ url: URL, settings: DevelopSettings, maxPixel: CGFloat, draft: Bool = false) -> UIImage? {
+        renderCGImage(url, settings: settings, maxPixel: maxPixel, draft: draft).map(UIImage.init(cgImage:))
     }
 
     /// Full-resolution HEIC or JPEG with the photo's settings applied.
@@ -141,11 +174,13 @@ enum RawRenderer {
         return CGImageDestinationFinalize(destination) ? data as Data : nil
     }
 
-    private static func renderCGImage(_ url: URL, settings: DevelopSettings, maxPixel: CGFloat) -> CGImage? {
+    /// `draft` trades demosaic quality for speed; fine at thumbnail size.
+    private static func renderCGImage(_ url: URL, settings: DevelopSettings, maxPixel: CGFloat, draft: Bool = false) -> CGImage? {
         guard let raw = CIRAWFilter(imageURL: url) else { return nil }
 
         let longest = max(raw.nativeSize.width, raw.nativeSize.height)
         if longest > maxPixel { raw.scaleFactor = Float(maxPixel / longest) }
+        raw.isDraftModeEnabled = draft
 
         raw.exposure = settings.exposure
         if let temperature = settings.temperature { raw.neutralTemperature = temperature }
@@ -174,15 +209,16 @@ enum RawRenderer {
         }
 
         if let film = settings.film {
-            image = FilmPipeline.apply(film, to: image, seed: grainSeed(for: url))
+            image = FilmPipeline.apply(film, to: image, seed: fnv1a(url.lastPathComponent))
         }
 
         return context.createCGImage(image, from: image.extent)
     }
 
-    /// Stable per-photo seed (FNV-1a of the file name) so grain doesn't change between renders.
-    private static func grainSeed(for url: URL) -> UInt64 {
-        url.lastPathComponent.utf8.reduce(14695981039346656037) { ($0 ^ UInt64($1)) &* 1099511628211 }
+    /// Stable hash (FNV-1a): the per-photo grain seed, so grain doesn't change
+    /// between renders, and thumbnail cache file names.
+    private static func fnv1a(_ string: String) -> UInt64 {
+        string.utf8.reduce(14695981039346656037) { ($0 ^ UInt64($1)) &* 1099511628211 }
     }
 }
 
