@@ -4,6 +4,7 @@ import SwiftUI
 struct ContentView: View {
     @StateObject private var camera = CameraController()
     @State private var showingInfo = false
+    @State private var showingGallery = false
 
     var body: some View {
         ZStack {
@@ -36,7 +37,7 @@ struct ContentView: View {
                 HStack {
                     lensMenu.frame(maxWidth: .infinity)
                     shutterButton
-                    Color.clear.frame(maxWidth: .infinity, maxHeight: 1)
+                    galleryButton.frame(maxWidth: .infinity)
                 }
                 .padding(.vertical, 24)
             }
@@ -45,6 +46,18 @@ struct ContentView: View {
         .task { camera.start() }
         .sheet(isPresented: $showingInfo) {
             CapabilitiesView(info: camera.info)
+        }
+        .fullScreenCover(isPresented: $showingGallery) {
+            GalleryView()
+        }
+    }
+
+    private var galleryButton: some View {
+        Button { showingGallery = true } label: {
+            Image(systemName: "photo.on.rectangle")
+                .font(.title2)
+                .frame(width: 52, height: 52)
+                .background(.white.opacity(0.15), in: Circle())
         }
     }
 
