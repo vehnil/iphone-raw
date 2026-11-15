@@ -19,7 +19,11 @@ extension FilmLook {
             fade: 0.02,
             saturation: 0.95,
             shadowTint: [0, 0.005, 0.01],
-            highlightTint: [0.02, 0.01, -0.01]
+            highlightTint: [0.02, 0.01, -0.01],
+            halation: 0.25,
+            bloom: 0.15,
+            grain: 0.35,
+            vignette: 0.2
         )),
         Preset(id: "vivid-slide", name: "Vivid Slide", look: FilmLook(
             colorMatrix: [1.06, -0.03, -0.03,
@@ -28,7 +32,12 @@ extension FilmLook {
             contrast: 1.2,
             rolloff: 0.25,
             saturation: 1.1,
-            shadowTint: [0, 0, 0.01]
+            shadowTint: [0, 0, 0.01],
+            halation: 0.1,
+            bloom: 0.05,
+            grain: 0.2,
+            grainSize: 0.8,
+            vignette: 0.3
         )),
         Preset(id: "tungsten-800", name: "Tungsten 800", look: FilmLook(
             colorMatrix: [0.95, 0.04, 0.01,
@@ -40,7 +49,12 @@ extension FilmLook {
             fade: 0.01,
             saturation: 0.95,
             shadowTint: [-0.015, 0.01, 0.03],
-            highlightTint: [0.02, 0, -0.01]
+            highlightTint: [0.02, 0, -0.01],
+            halation: 0.8,
+            bloom: 0.3,
+            grain: 0.6,
+            grainSize: 1.3,
+            vignette: 0.25
         )),
         Preset(id: "faded-print", name: "Faded Print", look: FilmLook(
             colorMatrix: [0.90, 0.07, 0.03,
@@ -52,7 +66,12 @@ extension FilmLook {
             fade: 0.08,
             saturation: 0.75,
             shadowTint: [0, 0.01, 0.015],
-            highlightTint: [0.03, 0.015, -0.01]
+            highlightTint: [0.03, 0.015, -0.01],
+            halation: 0.2,
+            bloom: 0.25,
+            grain: 0.45,
+            grainSize: 1.1,
+            vignette: 0.15
         )),
     ]
 }

@@ -74,7 +74,9 @@ enum RawRenderer {
             if raw.isLocalToneMapSupported { raw.localToneMapAmount = 0 }
             if raw.isSharpnessSupported { raw.sharpnessAmount = 0 }
             if raw.isLuminanceNoiseReductionSupported { raw.luminanceNoiseReductionAmount = 0 }
-            if raw.isColorNoiseReductionSupported { raw.colorNoiseReductionAmount = 0 }
+            // Colour noise blotches look digital, not like film, so film looks keep
+            // Apple's colour noise reduction; grain replaces the luminance noise.
+            if raw.isColorNoiseReductionSupported && settings.film == nil { raw.colorNoiseReductionAmount = 0 }
         }
 
         guard var image = raw.outputImage else { return nil }
@@ -88,10 +90,15 @@ enum RawRenderer {
         }
 
         if let film = settings.film {
-            image = FilmPipeline.apply(film, to: image)
+            image = FilmPipeline.apply(film, to: image, seed: grainSeed(for: url))
         }
 
         guard let cgImage = context.createCGImage(image, from: image.extent) else { return nil }
         return UIImage(cgImage: cgImage)
+    }
+
+    /// Stable per-photo seed (FNV-1a of the file name) so grain doesn't change between renders.
+    private static func grainSeed(for url: URL) -> UInt64 {
+        url.lastPathComponent.utf8.reduce(14695981039346656037) { ($0 ^ UInt64($1)) &* 1099511628211 }
     }
 }

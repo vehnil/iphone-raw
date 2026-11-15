@@ -14,6 +14,10 @@ namespace {
         return select(pow((v + 0.055) / 1.055, 2.4), v / 12.92, v <= 0.04045);
     }
 
+    float3 linearToSrgb(float3 v) {
+        return select(1.055 * pow(v, 1.0 / 2.4) - 0.055, v * 12.92, v <= 0.0031308);
+    }
+
     // Logistic curve in log exposure. The slope eases from `low` (toe and
     // mid-tones) to `high` (shoulder) so highlights roll off gently.
     float3 characteristic(float3 stops, float low, float high) {
@@ -49,6 +53,17 @@ float4 filmTone(sample_t s,
     d += shadowTint * (1.0 - l) * (1.0 - l) + highlightTint * l * l;
     d = mix(float3(dot(d, kLuma)), d, saturation);
 
+    return float4(srgbToLinear(saturate(d)), s.a);
+}
+
+/// Adds grain in display space. `noise` holds zero-centred grain in .r (fine)
+/// and .g (coarse); grain is strongest in the mid-tones, like a negative.
+float4 filmGrain(sample_t s, sample_t noise, float amount) {
+    float3 d = linearToSrgb(saturate(s.rgb));
+    float l = dot(d, kLuma);
+    float weight = 0.15 + 3.4 * l * (1.0 - l);
+    float n = noise.r + 0.5 * noise.g;
+    d += amount * weight * n;
     return float4(srgbToLinear(saturate(d)), s.a);
 }
 

@@ -30,4 +30,18 @@ struct FilmLook: Codable, Equatable {
     /// RGB offsets added to shadows and highlights (split toning).
     var shadowTint: [Float] = [0, 0, 0]
     var highlightTint: [Float] = [0, 0, 0]
+
+    // Optical and emulsion effects. Sizes are relative to the frame, so a look
+    // matches between thumbnail, preview and full-resolution export.
+
+    /// Red-orange glow around highlights.
+    var halation: Float = 0
+    /// Soft, neutral glow around highlights.
+    var bloom: Float = 0
+    /// Grain strength; strongest in the mid-tones.
+    var grain: Float = 0
+    /// 1 ≈ ISO 400 35mm; larger is coarser.
+    var grainSize: Float = 1
+    /// Darkening towards the corners.
+    var vignette: Float = 0
 }
