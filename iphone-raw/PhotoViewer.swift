@@ -9,6 +9,8 @@ struct PhotoViewer: View {
     let onDone: () -> Void
 
     @State private var showingEditor = false
+    @State private var isExporting = false
+    @State private var message: String?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -32,6 +34,17 @@ struct PhotoViewer: View {
                     .background(.bar)
             }
         }
+        .overlay(alignment: .top) {
+            if let message {
+                Text(message)
+                    .font(.footnote)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .background(.thinMaterial, in: Capsule())
+                    .padding(.top, 8)
+                    .transition(.opacity)
+            }
+        }
         .navigationTitle(title)
         .toolbar {
             ToolbarItem(placement: .topBarLeading) {
@@ -44,13 +57,51 @@ struct PhotoViewer: View {
             }
             ToolbarItemGroup(placement: .bottomBar) {
                 if let current {
-                    ShareLink(item: current)
+                    Menu {
+                        ShareLink("Share DNG", item: current)
+                        Section("Save to Photos with edits") {
+                            ForEach(ExportFormat.allCases) { format in
+                                Button("Save as \(format.name)") { export(current, as: format) }
+                            }
+                        }
+                    } label: {
+                        Image(systemName: "square.and.arrow.up")
+                    }
+                    .disabled(isExporting)
                 }
                 Spacer()
                 Button { showingEditor.toggle() } label: {
                     Image(systemName: "slider.horizontal.3")
                 }
             }
+        }
+    }
+
+    private func export(_ url: URL, as format: ExportFormat) {
+        isExporting = true
+        show("Exporting \(format.name)…", for: nil)
+        Task {
+            defer { isExporting = false }
+            guard let data = await RawRenderer.export(url, settings: edits.settings(for: url), as: format) else {
+                show("Export failed")
+                return
+            }
+            let name = url.deletingPathExtension().lastPathComponent + "." + (format.type.preferredFilenameExtension ?? format.rawValue)
+            do {
+                try await PhotosExport.save(data, filename: name)
+                show("Saved \(format.name) to Photos")
+            } catch {
+                show("Couldn't save: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func show(_ text: String, for seconds: Double? = 2) {
+        withAnimation { message = text }
+        guard let seconds else { return }
+        Task {
+            try? await Task.sleep(for: .seconds(seconds))
+            withAnimation { if message == text { message = nil } }
         }
     }
 

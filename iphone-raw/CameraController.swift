@@ -138,7 +138,7 @@ extension CameraController: AVCapturePhotoCaptureDelegate {
             publish { $0.status = "Capture failed: \(error.localizedDescription)" }
             return
         }
-        guard photo.isRawPhoto, let dng = photo.fileDataRepresentation() else {
+        guard photo.isRawPhoto, let dng = photo.fileDataRepresentation(with: MetadataAllowlist()) else {
             publish { $0.status = "Capture didn't return RAW data." }
             return
         }

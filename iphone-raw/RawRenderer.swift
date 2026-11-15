@@ -1,6 +1,17 @@
 import CoreImage
 import CoreImage.CIFilterBuiltins
+import ImageIO
 import UIKit
+import UniformTypeIdentifiers
+
+enum ExportFormat: String, CaseIterable, Identifiable {
+    case heic
+    case jpeg
+
+    var id: Self { self }
+    var name: String { rawValue.uppercased() }
+    var type: UTType { self == .heic ? .heic : .jpeg }
+}
 
 /// User-adjustable development of a Bayer DNG. The defaults are "neutral":
 /// none of Apple's look (boost, local tone mapping, sharpening, noise
@@ -78,6 +89,43 @@ enum RawRenderer {
     }
 
     private static func renderSync(_ url: URL, settings: DevelopSettings, maxPixel: CGFloat) -> UIImage? {
+        renderCGImage(url, settings: settings, maxPixel: maxPixel).map(UIImage.init(cgImage:))
+    }
+
+    /// Full-resolution HEIC or JPEG with the photo's settings applied.
+    static func export(_ url: URL, settings: DevelopSettings, as format: ExportFormat) async -> Data? {
+        await run(on: previewQueue) {
+            guard let image = renderCGImage(url, settings: settings, maxPixel: .infinity) else { return nil }
+            return encode(image, as: format, source: url)
+        }
+    }
+
+    private static func encode(_ image: CGImage, as format: ExportFormat, source: URL) -> Data? {
+        let data = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(data, format.type.identifier as CFString, 1, nil) else { return nil }
+
+        // Same allowlist as captures. The render is already upright and no longer RAW.
+        let sourceProperties = CGImageSourceCreateWithURL(source as CFURL, nil)
+            .flatMap { CGImageSourceCopyPropertiesAtIndex($0, 0, nil) as? [String: Any] } ?? [:]
+        var properties = MetadataAllowlist.filter(sourceProperties)
+        properties[kCGImagePropertyDNGDictionary as String] = nil
+        properties[kCGImagePropertyOrientation as String] = 1
+        if var tiff = properties[kCGImagePropertyTIFFDictionary as String] as? [String: Any] {
+            tiff[kCGImagePropertyTIFFOrientation as String] = 1
+            properties[kCGImagePropertyTIFFDictionary as String] = tiff
+        }
+        if var exif = properties[kCGImagePropertyExifDictionary as String] as? [String: Any] {
+            exif[kCGImagePropertyExifPixelXDimension as String] = image.width
+            exif[kCGImagePropertyExifPixelYDimension as String] = image.height
+            properties[kCGImagePropertyExifDictionary as String] = exif
+        }
+        properties[kCGImageDestinationLossyCompressionQuality as String] = 0.92
+
+        CGImageDestinationAddImage(destination, image, properties as CFDictionary)
+        return CGImageDestinationFinalize(destination) ? data as Data : nil
+    }
+
+    private static func renderCGImage(_ url: URL, settings: DevelopSettings, maxPixel: CGFloat) -> CGImage? {
         guard let raw = CIRAWFilter(imageURL: url) else { return nil }
 
         let longest = max(raw.nativeSize.width, raw.nativeSize.height)
@@ -113,8 +161,7 @@ enum RawRenderer {
             image = FilmPipeline.apply(film, to: image, seed: grainSeed(for: url))
         }
 
-        guard let cgImage = context.createCGImage(image, from: image.extent) else { return nil }
-        return UIImage(cgImage: cgImage)
+        return context.createCGImage(image, from: image.extent)
     }
 
     /// Stable per-photo seed (FNV-1a of the file name) so grain doesn't change between renders.
