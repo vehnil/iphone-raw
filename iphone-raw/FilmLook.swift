@@ -47,19 +47,20 @@ struct FilmLook: Codable, Equatable {
 }
 
 extension FilmLook {
-    /// Missing keys fall back to defaults, so saved looks survive new parameters being added.
+    /// Missing keys fall back to defaults, so saved looks survive new parameters
+    /// being added. So do arrays of the wrong length, which the pipeline can't use.
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         let d = FilmLook()
         strength = try c.decodeIfPresent(Float.self, forKey: .strength) ?? d.strength
-        colorMatrix = try c.decodeIfPresent([Float].self, forKey: .colorMatrix) ?? d.colorMatrix
+        colorMatrix = try c.decodeIfPresent([Float].self, forKey: .colorMatrix).flatMap { $0.count == 9 ? $0 : nil } ?? d.colorMatrix
         warmth = try c.decodeIfPresent(Float.self, forKey: .warmth) ?? d.warmth
         contrast = try c.decodeIfPresent(Float.self, forKey: .contrast) ?? d.contrast
         rolloff = try c.decodeIfPresent(Float.self, forKey: .rolloff) ?? d.rolloff
         fade = try c.decodeIfPresent(Float.self, forKey: .fade) ?? d.fade
         saturation = try c.decodeIfPresent(Float.self, forKey: .saturation) ?? d.saturation
-        shadowTint = try c.decodeIfPresent([Float].self, forKey: .shadowTint) ?? d.shadowTint
-        highlightTint = try c.decodeIfPresent([Float].self, forKey: .highlightTint) ?? d.highlightTint
+        shadowTint = try c.decodeIfPresent([Float].self, forKey: .shadowTint).flatMap { $0.count == 3 ? $0 : nil } ?? d.shadowTint
+        highlightTint = try c.decodeIfPresent([Float].self, forKey: .highlightTint).flatMap { $0.count == 3 ? $0 : nil } ?? d.highlightTint
         halation = try c.decodeIfPresent(Float.self, forKey: .halation) ?? d.halation
         bloom = try c.decodeIfPresent(Float.self, forKey: .bloom) ?? d.bloom
         grain = try c.decodeIfPresent(Float.self, forKey: .grain) ?? d.grain

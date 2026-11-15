@@ -21,15 +21,33 @@ final class PhotoLibrary: ObservableObject {
         refresh()
     }
 
-    private static let nameFormat: DateFormatter = {
+    // Captures are named RAW_yyyyMMdd_HHmmss_SSS.dng; older ones have no
+    // milliseconds. Both sort by name in capture order.
+    private static func formatter(_ format: String) -> DateFormatter {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "'RAW_'yyyyMMdd_HHmmss"
+        formatter.dateFormat = format
         return formatter
-    }()
+    }
+    private static let nameFormat = formatter("'RAW_'yyyyMMdd_HHmmss_SSS")
+    private static let secondsNameFormat = formatter("'RAW_'yyyyMMdd_HHmmss")
+
+    /// A Documents URL for a new capture that no existing file uses.
+    static func newCaptureURL(at date: Date = Date()) -> URL {
+        let base = nameFormat.string(from: date)
+        var url = URL.documentsDirectory.appending(path: "\(base).dng")
+        var copy = 2
+        while FileManager.default.fileExists(atPath: url.path) {
+            url = URL.documentsDirectory.appending(path: "\(base)_\(copy).dng")
+            copy += 1
+        }
+        return url
+    }
 
     /// Capture time, from the file name.
     static func captureDate(of url: URL) -> Date? {
-        nameFormat.date(from: url.deletingPathExtension().lastPathComponent)
+        let name = url.deletingPathExtension().lastPathComponent
+        // "RAW_yyyyMMdd_HHmmss" is 19 characters, plus "_SSS" in newer names.
+        return nameFormat.date(from: String(name.prefix(23))) ?? secondsNameFormat.date(from: String(name.prefix(19)))
     }
 }

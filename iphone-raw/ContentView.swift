@@ -6,6 +6,7 @@ struct ContentView: View {
     @StateObject private var camera = CameraController()
     @State private var showingSettings = false
     @State private var showingGallery = false
+    @Environment(\.scenePhase) private var scenePhase
 
     @AppStorage("flash") private var flash = FlashOption.off
     @AppStorage("timer") private var timer = TimerOption.off
@@ -24,7 +25,7 @@ struct ContentView: View {
             VStack(spacing: 0) {
                 topBar
                 Spacer(minLength: 0)
-                Viewfinder(camera: camera, crop: crop, showsGrid: showsGrid, showsLevel: showsLevel)
+                Viewfinder(camera: camera, crop: crop, showsGrid: showsGrid, showsLevel: showsLevel && isCameraShowing)
                     .overlay {
                         if let countdown {
                             Text("\(countdown)")
@@ -58,6 +59,8 @@ struct ContentView: View {
             .foregroundStyle(.white)
         }
         .task { camera.start() }
+        // The gallery covers the camera without removing it, so stop it explicitly.
+        .onChange(of: isCameraShowing) { _, showing in camera.setActive(showing) }
         // Either volume button takes the picture.
         .onCameraCaptureEvent(isEnabled: !showingGallery && !showingSettings) { event in
             if event.phase == .ended { shutter() }
@@ -73,6 +76,8 @@ struct ContentView: View {
             GalleryView()
         }
     }
+
+    private var isCameraShowing: Bool { !showingGallery && scenePhase != .background }
 
     private var canCapture: Bool { !camera.isCapturing && camera.info.hasBayer }
 

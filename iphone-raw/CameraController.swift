@@ -38,6 +38,10 @@ final class CameraController: NSObject, ObservableObject {
     private let sessionQueue = DispatchQueue(label: "iphoneraw.session")
     private var input: AVCaptureDeviceInput?
     private var subjectObserver: NSObjectProtocol?
+    /// Session-queue state: whether the camera screen is showing, and shots
+    /// still being processed. The session only stops once both allow it.
+    private var wantsRunning = true
+    private var capturesInFlight = 0
 
     func start() {
         Task {
@@ -64,18 +68,43 @@ final class CameraController: NSObject, ObservableObject {
         }
     }
 
+    /// Runs the camera only while its screen is showing. Stopping waits for
+    /// shots in flight, so opening the gallery right after the shutter can't lose one.
+    func setActive(_ active: Bool) {
+        sessionQueue.async { [self] in
+            wantsRunning = active
+            updateRunning()
+        }
+    }
+
+    /// Session queue only.
+    private func updateRunning() {
+        if wantsRunning, input != nil, !session.isRunning {
+            session.startRunning()
+        } else if !wantsRunning, capturesInFlight == 0, session.isRunning {
+            session.stopRunning()
+        }
+    }
+
     func select(_ device: AVCaptureDevice) {
         sessionQueue.async { [self] in
             session.beginConfiguration()
             session.sessionPreset = .photo
 
-            if let input { session.removeInput(input) }
+            let previous = input
+            if let previous { session.removeInput(previous) }
             do {
                 let newInput = try AVCaptureDeviceInput(device: device)
                 guard session.canAddInput(newInput) else { throw CocoaError(.featureUnsupported) }
                 session.addInput(newInput)
                 input = newInput
             } catch {
+                // Keep shooting with the lens we had.
+                if let previous, session.canAddInput(previous) {
+                    session.addInput(previous)
+                } else {
+                    input = nil
+                }
                 session.commitConfiguration()
                 publish { $0.status = "Couldn't open \(device.localizedName): \(error.localizedDescription)" }
                 return
@@ -93,7 +122,7 @@ final class CameraController: NSObject, ObservableObject {
             }
 
             session.commitConfiguration()
-            if !session.isRunning { session.startRunning() }
+            updateRunning()
 
             // RAW formats are only reported once the output is attached to a configured session.
             var info = CaptureInfo()
@@ -185,6 +214,7 @@ final class CameraController: NSObject, ObservableObject {
                 $0.isCapturing = true
                 $0.status = ""
             }
+            capturesInFlight += 1
             output.capturePhoto(with: settings, delegate: Capture(camera: self, crop: crop))
         }
     }
@@ -228,21 +258,27 @@ private final class Capture: NSObject, AVCapturePhotoCaptureDelegate {
 
     func photoOutput(_ output: AVCapturePhotoOutput, didFinishCaptureFor resolvedSettings: AVCaptureResolvedPhotoSettings, error: Error?) {
         camera.publish { $0.isCapturing = false }
+        camera.captureFinished()
         Self.lock.withLock { _ = Self.inFlight.remove(self) }
     }
 }
 
 extension CameraController {
+    fileprivate func captureFinished() {
+        sessionQueue.async { [self] in
+            capturesInFlight -= 1
+            updateRunning()
+        }
+    }
+
     /// Writes the DNG to the app's Documents folder (visible in the Files app)
     /// and adds it to the photo library as a RAW + HEIC pair.
     fileprivate func save(_ dng: Data, crop: CropAspect) {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyyMMdd_HHmmss"
-        let name = "RAW_\(formatter.string(from: Date())).dng"
-        let url = URL.documentsDirectory.appending(path: name)
+        let url = PhotoLibrary.newCaptureURL()
+        let name = url.lastPathComponent
 
         do {
-            try dng.write(to: url)
+            try dng.write(to: url, options: .withoutOverwriting)
         } catch {
             publish { $0.status = "Couldn't write \(name): \(error.localizedDescription)" }
             return

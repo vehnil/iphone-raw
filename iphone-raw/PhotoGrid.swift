@@ -3,7 +3,7 @@ import SwiftUI
 /// Chronological grid (newest at the bottom) with multi-select, bulk share and delete.
 struct PhotoGrid: View {
     @ObservedObject var library: PhotoLibrary
-    @ObservedObject var edits: EditStore
+    let edits: EditStore
     let onOpen: (URL) -> Void
     let onDone: () -> Void
 
@@ -122,6 +122,13 @@ private struct Thumbnail: View {
     let url: URL
     let settings: DevelopSettings
     @State private var image: UIImage?
+
+    init(url: URL, settings: DevelopSettings) {
+        self.url = url
+        self.settings = settings
+        // Start from a cached thumbnail so cells don't flash grey while scrolling.
+        _image = State(initialValue: RawRenderer.cachedThumbnail(for: url, settings: settings))
+    }
 
     var body: some View {
         Color.gray.opacity(0.2)

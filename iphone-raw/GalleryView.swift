@@ -3,7 +3,7 @@ import SwiftUI
 /// Opens on the most recent photo; swipe right for older ones, or switch to the grid.
 struct GalleryView: View {
     @StateObject private var library = PhotoLibrary()
-    @StateObject private var edits = EditStore()
+    @State private var edits = EditStore()
     @Environment(\.dismiss) private var dismiss
 
     @State private var showingGrid = false
@@ -34,6 +34,7 @@ struct GalleryView: View {
         .onAppear {
             library.refresh()
             current = library.photos.last
+            RawRenderer.trimThumbnailCache(keeping: library.photos)
         }
         .onChange(of: library.photos) { _, photos in
             if let current, photos.contains(current) { return }

@@ -66,6 +66,13 @@ enum RawRenderer {
     private static let thumbnailDirectory = URL.cachesDirectory.appending(path: "thumbnails")
     /// Reading a cached JPEG is cheap and safe to do in parallel, unlike a RAW decode.
     private static let diskQueue = DispatchQueue(label: "iphoneraw.thumbnails.disk", qos: .userInitiated, attributes: .concurrent)
+    /// The disk cache is trimmed back to `thumbnailTrimTarget` once it passes this.
+    private static let thumbnailDiskLimit = 200 << 20
+    private static let thumbnailTrimTarget = 150 << 20
+    /// Memory-cache keys for each photo, so its thumbnails can be evicted when
+    /// it's deleted; NSCache can't be enumerated.
+    private static let memoryKeysLock = NSLock()
+    private static var memoryKeys: [String: Set<NSString>] = [:]
 
     // RAW decodes block their thread until done. Run on Swift's cooperative
     // pool (one thread per core), a gallery's worth of them occupies every
@@ -95,7 +102,10 @@ enum RawRenderer {
 
         let file = thumbnailDirectory.appending(path: url.lastPathComponent).appending(path: "\(fnv1a(key as String)).jpg")
         var image = await run(on: diskQueue) {
-            (try? Data(contentsOf: file)).flatMap(UIImage.init(data:))?.preparingForDisplay()
+            let image = (try? Data(contentsOf: file)).flatMap(UIImage.init(data:))?.preparingForDisplay()
+            // Marks it recently used, for trimming.
+            if image != nil { try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: file.path) }
+            return image
         }
         if image == nil {
             image = await run(on: thumbnailQueue) {
@@ -108,12 +118,43 @@ enum RawRenderer {
         }
         if let image {
             thumbnails.setObject(image, forKey: key, cost: Int(image.size.width * image.size.height * image.scale * image.scale * 4))
+            memoryKeysLock.withLock { _ = memoryKeys[url.lastPathComponent, default: []].insert(key) }
         }
         return image
     }
 
     static func removeCachedThumbnails(for url: URL) {
+        let keys = memoryKeysLock.withLock { memoryKeys.removeValue(forKey: url.lastPathComponent) ?? [] }
+        for key in keys { thumbnails.removeObject(forKey: key) }
         try? FileManager.default.removeItem(at: thumbnailDirectory.appending(path: url.lastPathComponent))
+    }
+
+    /// Removes cached thumbnails of photos that are gone, then the least
+    /// recently used ones while the cache is over its limit.
+    static func trimThumbnailCache(keeping photos: [URL]) {
+        DispatchQueue.global(qos: .utility).async {
+            let manager = FileManager.default
+            let keep = Set(photos.map(\.lastPathComponent))
+            let folders = (try? manager.contentsOfDirectory(at: thumbnailDirectory, includingPropertiesForKeys: nil)) ?? []
+            for folder in folders where !keep.contains(folder.lastPathComponent) {
+                try? manager.removeItem(at: folder)
+            }
+
+            let keys: [URLResourceKey] = [.fileSizeKey, .contentModificationDateKey]
+            var files: [(url: URL, size: Int, used: Date)] = []
+            for folder in folders where keep.contains(folder.lastPathComponent) {
+                for file in (try? manager.contentsOfDirectory(at: folder, includingPropertiesForKeys: keys)) ?? [] {
+                    let values = try? file.resourceValues(forKeys: Set(keys))
+                    files.append((file, values?.fileSize ?? 0, values?.contentModificationDate ?? .distantPast))
+                }
+            }
+            var total = files.reduce(0) { $0 + $1.size }
+            guard total > thumbnailDiskLimit else { return }
+            for file in files.sorted(by: { $0.used < $1.used }) where total > thumbnailTrimTarget {
+                try? manager.removeItem(at: file.url)
+                total -= file.size
+            }
+        }
     }
 
     static func render(_ url: URL, settings: DevelopSettings, maxPixel: CGFloat, priority: Priority = .preview) async -> UIImage? {
@@ -135,9 +176,14 @@ enum RawRenderer {
         }
     }
 
+    /// Bump when rendering changes, so cached thumbnails are made again.
+    /// 2: grain, halation and bloom render (they were blank before).
+    /// 3: halation and bloom thresholds work with clipped highlights.
+    private static let renderVersion = 3
+
     private static func cacheKey(_ url: URL, _ settings: DevelopSettings) -> NSString {
         let encoded = (try? JSONEncoder().encode(settings)).map { String(decoding: $0, as: UTF8.self) } ?? ""
-        return "\(url.lastPathComponent)|\(encoded)" as NSString
+        return "\(url.lastPathComponent)|v\(renderVersion)|\(encoded)" as NSString
     }
 
     private static func renderSync(_ url: URL, settings: DevelopSettings, maxPixel: CGFloat, draft: Bool = false) -> UIImage? {
@@ -191,6 +237,35 @@ enum RawRenderer {
 
     /// `draft` trades demosaic quality for speed; fine at thumbnail size.
     private static func renderCGImage(_ url: URL, settings: DevelopSettings, maxPixel: CGFloat, draft: Bool = false) -> CGImage? {
+        guard var image = developed(url, settings: settings, maxPixel: maxPixel, draft: draft) else { return nil }
+        if let film = settings.film {
+            image = FilmPipeline.apply(film, to: image, seed: fnv1a(url.lastPathComponent))
+        }
+        return context.createCGImage(image, from: image.extent)
+    }
+
+    /// The photo with each look (`nil` for none) on top of `settings`, for the
+    /// look chips. The RAW is decoded once and shared by every look.
+    static func lookPreviews(_ url: URL, settings: DevelopSettings, looks: [FilmLook?], maxPixel: CGFloat) async -> [UIImage?] {
+        await run(on: thumbnailQueue) {
+            var neutral = settings
+            neutral.film = nil
+            guard let decoded = developed(url, settings: neutral, maxPixel: maxPixel, draft: true),
+                  let linear = CGColorSpace(name: CGColorSpace.extendedLinearSRGB),
+                  let bitmap = context.createCGImage(decoded, from: decoded.extent, format: .RGBAh, colorSpace: linear)
+            else { return nil }
+            // Rendered to a float bitmap so the looks reuse it instead of each re-running the decode.
+            let base = CIImage(cgImage: bitmap)
+            let seed = fnv1a(url.lastPathComponent)
+            return looks.map { look in
+                let image = look.map { FilmPipeline.apply($0, to: base, seed: seed) } ?? base
+                return context.createCGImage(image, from: image.extent).map(UIImage.init(cgImage:))
+            }
+        } ?? looks.map { _ in nil }
+    }
+
+    /// The RAW decoded with `settings`, cropped and saturated, before any film look.
+    private static func developed(_ url: URL, settings: DevelopSettings, maxPixel: CGFloat, draft: Bool) -> CIImage? {
         guard let raw = CIRAWFilter(imageURL: url) else { return nil }
 
         let longest = max(raw.nativeSize.width, raw.nativeSize.height)
@@ -228,12 +303,7 @@ enum RawRenderer {
             controls.saturation = settings.saturation
             image = controls.outputImage ?? image
         }
-
-        if let film = settings.film {
-            image = FilmPipeline.apply(film, to: image, seed: fnv1a(url.lastPathComponent))
-        }
-
-        return context.createCGImage(image, from: image.extent)
+        return image
     }
 
     /// Stable hash (FNV-1a): the per-photo grain seed, so grain doesn't change

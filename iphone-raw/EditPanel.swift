@@ -3,11 +3,12 @@ import SwiftUI
 /// Develop and Film controls for one photo.
 struct EditPanel: View {
     let url: URL
-    @ObservedObject var edits: EditStore
+    let edits: EditStore
 
     private enum Tab { case develop, film }
     @State private var tab = Tab.film
     @State private var asShot: DevelopSettings?
+    @State private var asShotFailed = false
 
     var body: some View {
         VStack(spacing: 12) {
@@ -21,6 +22,9 @@ struct EditPanel: View {
             case .develop:
                 if let asShot {
                     DevelopControls(settings: edits.binding(for: url), asShot: asShot)
+                } else if asShotFailed {
+                    Text("This photo's RAW data couldn't be read.")
+                        .foregroundStyle(.secondary)
                 } else {
                     ProgressView()
                 }
@@ -30,7 +34,10 @@ struct EditPanel: View {
         }
         .font(.footnote)
         .padding()
-        .task { asShot = await edits.asShotSettings(for: url) }
+        .task {
+            asShot = await edits.asShotSettings(for: url)
+            asShotFailed = asShot == nil && !Task.isCancelled
+        }
     }
 }
 
@@ -80,17 +87,19 @@ private struct DevelopControls: View {
 private struct FilmControls: View {
     let url: URL
     @Binding var settings: DevelopSettings
+    /// Chip previews: "Off" first, then each preset.
+    @State private var previews: [UIImage?] = []
 
     var body: some View {
         VStack(spacing: 8) {
             ScrollView(.horizontal) {
                 HStack(spacing: 10) {
-                    LookChip(name: "Off", url: url, settings: with(nil), isSelected: settings.film == nil) {
+                    LookChip(name: "Off", image: preview(0), isSelected: settings.film == nil) {
                         settings.film = nil
                         settings.filmPresetID = nil
                     }
-                    ForEach(FilmLook.presets) { preset in
-                        LookChip(name: preset.name, url: url, settings: with(preset.look),
+                    ForEach(Array(FilmLook.presets.enumerated()), id: \.element.id) { index, preset in
+                        LookChip(name: preset.name, image: preview(index + 1),
                                  isSelected: settings.filmPresetID == preset.id) {
                             settings.film = preset.look
                             settings.filmPresetID = preset.id
@@ -99,23 +108,33 @@ private struct FilmControls: View {
                 }
             }
             .scrollIndicators(.hidden)
+            // Previews only depend on the develop settings: the look sliders don't change them.
+            .task(id: with(nil)) {
+                previews = await RawRenderer.lookPreviews(url, settings: with(nil),
+                                                          looks: [nil] + FilmLook.presets.map(\.look), maxPixel: 160)
+            }
 
             if settings.film != nil {
                 SliderRow("Strength", value: film(\.strength), in: 0...1, format: "%.2f")
                 SliderRow("Grain", value: film(\.grain), in: 0...1, format: "%.2f")
                 SliderRow("Halation", value: film(\.halation), in: 0...1, format: "%.2f")
+                SliderRow("Bloom", value: film(\.bloom), in: 0...1, format: "%.2f")
                 SliderRow("Roll-off", value: film(\.rolloff), in: 0...1, format: "%.2f")
                 SliderRow("Fade", value: film(\.fade), in: 0...0.15, format: "%.2f")
             }
         }
     }
 
-    /// This photo's development with a different look, for the chip previews.
+    /// This photo's development with a different look.
     private func with(_ look: FilmLook?) -> DevelopSettings {
         var preview = settings
         preview.film = look
         preview.filmPresetID = nil
         return preview
+    }
+
+    private func preview(_ index: Int) -> UIImage? {
+        previews.indices.contains(index) ? previews[index] : nil
     }
 
     private func film(_ keyPath: WritableKeyPath<FilmLook, Float>) -> Binding<Float> {
@@ -126,12 +145,9 @@ private struct FilmControls: View {
 
 private struct LookChip: View {
     let name: String
-    let url: URL
-    let settings: DevelopSettings
+    let image: UIImage?
     let isSelected: Bool
     let action: () -> Void
-
-    @State private var image: UIImage?
 
     var body: some View {
         Button(action: action) {
@@ -154,9 +170,6 @@ private struct LookChip: View {
             }
         }
         .buttonStyle(.plain)
-        .task(id: settings) {
-            image = await RawRenderer.render(url, settings: settings, maxPixel: 160, priority: .thumbnail)
-        }
     }
 }
 

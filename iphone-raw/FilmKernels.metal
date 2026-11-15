@@ -56,15 +56,27 @@ float4 filmTone(sample_t s,
     return float4(srgbToLinear(saturate(d)), s.a);
 }
 
-/// Adds grain in display space. `noise` holds zero-centred grain in .r (fine)
-/// and .g (coarse); grain is strongest in the mid-tones, like a negative.
-float4 filmGrain(sample_t s, sample_t noise, float amount) {
+/// Adds grain in display space. `fine` and `coarse` hold zero-centred grain in
+/// .r; grain is strongest in the mid-tones, like a negative.
+float4 filmGrain(sample_t s, sample_t fine, sample_t coarse, float amount) {
     float3 d = linearToSrgb(saturate(s.rgb));
     float l = dot(d, kLuma);
     float weight = 0.15 + 3.4 * l * (1.0 - l);
-    float n = noise.r + 0.5 * noise.g;
+    float n = fine.r + 0.5 * coarse.r;
     d += amount * weight * n;
     return float4(srgbToLinear(saturate(d)), s.a);
+}
+
+/// Adds `light` (bloom) to the image in linear light, keeping the image's
+/// alpha. Built-in addition would add the alphas too.
+float4 addLight(sample_t s, sample_t light) {
+    return float4(s.rgb + light.rgb, s.a);
+}
+
+/// Adds only the light that `blurred` spreads beyond `source` (halation): a
+/// halo around highlights, leaving the inside of a large bright area its own colour.
+float4 addHalo(sample_t s, sample_t blurred, sample_t source) {
+    return float4(s.rgb + max(blurred.rgb - source.rgb, 0.0), s.a);
 }
 
 }

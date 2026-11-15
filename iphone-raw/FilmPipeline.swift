@@ -13,6 +13,12 @@ enum FilmPipeline {
     private static let library: Data? = libraryURL.flatMap { try? Data(contentsOf: $0) }
     private static let toneKernel = library.flatMap { try? CIColorKernel(functionName: "filmTone", fromMetalLibraryData: $0) }
     private static let grainKernel = library.flatMap { try? CIColorKernel(functionName: "filmGrain", fromMetalLibraryData: $0) }
+    private static let lightKernel = library.flatMap { try? CIColorKernel(functionName: "addLight", fromMetalLibraryData: $0) }
+    private static let haloKernel = library.flatMap { try? CIColorKernel(functionName: "addHalo", fromMetalLibraryData: $0) }
+
+    // Glow shape: luminance threshold, blur radius (fraction of the long edge), and gain at slider 1.
+    enum HalationTuning { static let threshold: CGFloat = 0.7, radius: CGFloat = 0.006, strength: Float = 1.2 }
+    enum BloomTuning { static let threshold: CGFloat = 0.45, radius: CGFloat = 0.03, strength: Float = 0.5 }
 
     /// Long edge, in pixels, that effect sizes are tuned for (full-resolution capture).
     private static let referenceLongEdge: CGFloat = 4000
@@ -29,13 +35,15 @@ enum FilmPipeline {
             image = vignette(image, amount: look.vignette)
         }
         if look.halation > 0 {
-            // Light scattered back from the film base re-exposes mostly the red layer.
-            image = addGlow(to: image, threshold: 0.9, radius: 0.004 * longEdge,
-                            tint: (1, 0.25, 0.05), strength: 0.8 * look.halation)
+            // Light scattered back from the film base re-exposes mostly the red
+            // layer: a tight red-orange halo around the brightest highlights.
+            image = addGlow(to: image, threshold: HalationTuning.threshold, radius: HalationTuning.radius * longEdge,
+                            tint: (1, 0.3, 0.08), strength: HalationTuning.strength * look.halation, haloOnly: true)
         }
         if look.bloom > 0 {
-            image = addGlow(to: image, threshold: 0.5, radius: 0.02 * longEdge,
-                            tint: (1, 1, 1), strength: 0.25 * look.bloom)
+            // Light scattered in the lens and emulsion: a wide, soft, neutral glow.
+            image = addGlow(to: image, threshold: BloomTuning.threshold, radius: BloomTuning.radius * longEdge,
+                            tint: (1, 1, 1), strength: BloomTuning.strength * look.bloom, haloOnly: false)
         }
         image = tone(look, image)
         if look.grain > 0 {
@@ -76,37 +84,40 @@ enum FilmPipeline {
         return filter.outputImage ?? image
     }
 
-    /// Takes the light above `threshold`, tints and blurs it, and adds it back.
+    /// Takes the light whose luminance is over `threshold`, tints and blurs it,
+    /// and adds it back. The excess is scaled so a clipped highlight (1.0, as
+    /// a RAW decode delivers blown areas) counts fully, however high the threshold.
+    /// `haloOnly` adds just the light spread past the highlights' edges.
     private static func addGlow(to image: CIImage, threshold: CGFloat, radius: CGFloat,
-                                tint: (r: CGFloat, g: CGFloat, b: CGFloat), strength: Float) -> CIImage {
+                                tint: (r: CGFloat, g: CGFloat, b: CGFloat), strength: Float, haloOnly: Bool) -> CIImage {
+        guard let lightKernel, let haloKernel else { return image }
         let extent = image.extent
 
+        // tint × k × (luminance − threshold), with k = strength / (1 − threshold).
+        // Alpha stays 1: Core Image filters premultiply their output, so alpha 0 would zero the glow.
+        let k = CGFloat(strength) / (1 - threshold)
+        func row(_ t: CGFloat) -> CIVector { CIVector(x: luma.r * t * k, y: luma.g * t * k, z: luma.b * t * k, w: 0) }
         let over = CIFilter.colorMatrix()
         over.inputImage = image
-        over.biasVector = CIVector(x: -threshold, y: -threshold, z: -threshold, w: 0)
+        over.rVector = row(tint.r)
+        over.gVector = row(tint.g)
+        over.bVector = row(tint.b)
+        over.biasVector = CIVector(x: -tint.r * k * threshold, y: -tint.g * k * threshold, z: -tint.b * k * threshold, w: 0)
         let clamp = CIFilter.colorClamp()
         clamp.inputImage = over.outputImage
         clamp.minComponents = CIVector(x: 0, y: 0, z: 0, w: 0)
         clamp.maxComponents = CIVector(x: 64, y: 64, z: 64, w: 1)
 
-        // Luminance of the highlights, tinted; alpha 0 so the addition keeps the image's alpha.
-        let s = CGFloat(strength)
-        let tinted = CIFilter.colorMatrix()
-        tinted.inputImage = clamp.outputImage
-        tinted.rVector = CIVector(x: luma.r * tint.r * s, y: luma.g * tint.r * s, z: luma.b * tint.r * s, w: 0)
-        tinted.gVector = CIVector(x: luma.r * tint.g * s, y: luma.g * tint.g * s, z: luma.b * tint.g * s, w: 0)
-        tinted.bVector = CIVector(x: luma.r * tint.b * s, y: luma.g * tint.b * s, z: luma.b * tint.b * s, w: 0)
-        tinted.aVector = CIVector(x: 0, y: 0, z: 0, w: 0)
-
-        guard let glow = tinted.outputImage?
+        guard let source = clamp.outputImage else { return image }
+        let glow = source
             .clampedToExtent()
             .applyingGaussianBlur(sigma: Double(radius))
-            .cropped(to: extent) else { return image }
+            .cropped(to: extent)
 
-        let add = CIFilter.additionCompositing()
-        add.inputImage = glow
-        add.backgroundImage = image
-        return add.outputImage ?? image
+        if haloOnly {
+            return haloKernel.apply(extent: extent, arguments: [image, glow, source]) ?? image
+        }
+        return lightKernel.apply(extent: extent, arguments: [image, glow]) ?? image
     }
 
     private static func tone(_ look: FilmLook, _ image: CIImage) -> CIImage {
@@ -131,20 +142,18 @@ enum FilmPipeline {
 
         let fine = noise(cell: cell, seed: seed, channel: 0)
         let coarse = noise(cell: cell * 2.5, seed: seed &+ 7919, channel: 1)
-        let add = CIFilter.additionCompositing()
-        add.inputImage = fine.image
-        add.backgroundImage = coarse.image
-        guard let combined = add.outputImage?.cropped(to: extent) else { return image }
 
         // Grain finer than a pixel averages out, so it shrinks in small renders.
         let visible = amount * 0.28 * fine.amplitude
-        return grainKernel.apply(extent: extent, arguments: [image, combined, visible]) ?? image
+        return grainKernel.apply(extent: extent, arguments: [image, fine.image, coarse.image, visible]) ?? image
     }
 
-    /// Zero-centred noise in one channel, with clumps about `cell` pixels across.
+    /// Zero-centred noise in .r, taken from one channel of the random generator
+    /// so the fine and coarse layers are independent, with clumps about `cell` pixels across.
     private static func noise(cell: CGFloat, seed: UInt64, channel: Int) -> (image: CIImage, amplitude: Float) {
         let offset = CGAffineTransform(translationX: -CGFloat(seed % 4096), y: -CGFloat((seed / 4096) % 4096))
-        var random = CIFilter.randomGenerator().outputImage!.transformed(by: offset)
+        // The generator randomises alpha too; make it opaque before any filter unpremultiplies it.
+        var random = CIFilter.randomGenerator().outputImage!.settingAlphaOne(in: .infinite).transformed(by: offset)
         if cell > 1 {
             random = random
                 .transformed(by: CGAffineTransform(scaleX: cell, y: cell))
@@ -153,12 +162,13 @@ enum FilmPipeline {
 
         let pick = CIFilter.colorMatrix()
         pick.inputImage = random
-        let one = CIVector(x: channel == 0 ? 1 : 0, y: channel == 0 ? 0 : 1, z: 0, w: 0)
-        pick.rVector = channel == 0 ? one : CIVector(x: 0, y: 0, z: 0, w: 0)
-        pick.gVector = channel == 1 ? one : CIVector(x: 0, y: 0, z: 0, w: 0)
-        pick.bVector = CIVector(x: 0, y: 0, z: 0, w: 0)
-        pick.aVector = CIVector(x: 0, y: 0, z: 0, w: 0)
-        pick.biasVector = CIVector(x: channel == 0 ? -0.5 : 0, y: channel == 1 ? -0.5 : 0, z: 0, w: 0)
+        let zero = CIVector(x: 0, y: 0, z: 0, w: 0)
+        pick.rVector = CIVector(x: channel == 0 ? 1 : 0, y: channel == 1 ? 1 : 0, z: 0, w: 0)
+        pick.gVector = zero
+        pick.bVector = zero
+        // Opaque: Core Image premultiplies filter output, so alpha 0 would zero the noise.
+        pick.aVector = zero
+        pick.biasVector = CIVector(x: -0.5, y: 0, z: 0, w: 1)
         return (pick.outputImage!, Float(min(cell, 1)))
     }
 
