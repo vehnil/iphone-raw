@@ -6,6 +6,9 @@ final class EditStore: ObservableObject {
     @Published private var archive = EditArchive.load()
     private var asShot: [URL: DevelopSettings] = [:]
     private var pendingSave: Task<Void, Never>?
+    /// Photos changed here since the last save. Only these are written, so the
+    /// store never overwrites entries saved elsewhere (a new capture's crop).
+    private var changed: Set<String> = []
 
     func settings(for url: URL) -> DevelopSettings {
         archive.photos[url.lastPathComponent] ?? DevelopSettings()
@@ -18,6 +21,7 @@ final class EditStore: ObservableObject {
     func forget(_ urls: some Collection<URL>) {
         for url in urls {
             archive.photos[url.lastPathComponent] = nil
+            changed.insert(url.lastPathComponent)
         }
         scheduleSave()
     }
@@ -40,16 +44,20 @@ final class EditStore: ObservableObject {
 
     private func update(_ url: URL, _ settings: DevelopSettings) {
         archive.photos[url.lastPathComponent] = settings
+        changed.insert(url.lastPathComponent)
         scheduleSave()
     }
 
     /// Coalesces slider drags into one write.
     private func scheduleSave() {
         pendingSave?.cancel()
-        pendingSave = Task { [archive] in
+        pendingSave = Task { [archive, changed] in
             try? await Task.sleep(for: .milliseconds(500))
             guard !Task.isCancelled else { return }
-            archive.save()
+            EditArchive.update { saved in
+                for name in changed { saved.photos[name] = archive.photos[name] }
+            }
+            self.changed.subtract(changed)
         }
     }
 }

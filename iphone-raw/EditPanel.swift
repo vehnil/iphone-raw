@@ -45,6 +45,11 @@ private struct DevelopControls: View {
             SliderRow("Tint", value: optional($settings.tint, fallback: 0), in: -150...150, format: "%+.0f")
             SliderRow("Saturation", value: $settings.saturation, in: 0...2, format: "%.2f")
 
+            Picker("Crop", selection: crop) {
+                ForEach(CropAspect.allCases) { Text($0.name).tag($0) }
+            }
+            .pickerStyle(.segmented)
+
             Toggle("Apple processing", isOn: $settings.appleLook)
             Toggle("Lens correction", isOn: $settings.lensCorrection)
 
@@ -53,11 +58,17 @@ private struct DevelopControls: View {
         }
     }
 
-    /// As-shot development, keeping the chosen film look.
+    private var crop: Binding<CropAspect> {
+        Binding(get: { settings.crop ?? .fourThree },
+                set: { settings.crop = $0 == .fourThree ? nil : $0 })
+    }
+
+    /// As-shot development, keeping the chosen film look and crop.
     private var resetSettings: DevelopSettings {
         var reset = asShot
         reset.film = settings.film
         reset.filmPresetID = settings.filmPresetID
+        reset.crop = settings.crop
         return reset
     }
 

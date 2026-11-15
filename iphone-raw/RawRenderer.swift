@@ -27,6 +27,8 @@ struct DevelopSettings: Codable, Equatable {
     var film: FilmLook?
     /// The preset `film` started from, for highlighting it in the UI.
     var filmPresetID: String?
+    /// `nil` is the full 4:3 frame.
+    var crop: CropAspect?
 }
 
 extension DevelopSettings {
@@ -42,6 +44,7 @@ extension DevelopSettings {
         lensCorrection = try c.decodeIfPresent(Bool.self, forKey: .lensCorrection) ?? d.lensCorrection
         film = try c.decodeIfPresent(FilmLook.self, forKey: .film)
         filmPresetID = try c.decodeIfPresent(String.self, forKey: .filmPresetID)
+        crop = try? c.decodeIfPresent(CropAspect.self, forKey: .crop)
     }
 }
 
@@ -170,8 +173,20 @@ enum RawRenderer {
         }
         properties[kCGImageDestinationLossyCompressionQuality as String] = 0.92
 
-        CGImageDestinationAddImage(destination, image, properties as CFDictionary)
+        CGImageDestinationAddImage(destination, opaque(image), properties as CFDictionary)
         return CGImageDestinationFinalize(destination) ? data as Data : nil
+    }
+
+    /// Core Image renders with an alpha channel, but photos are opaque; without
+    /// one, ImageIO doesn't have to strip it (and complain) on every save.
+    private static func opaque(_ image: CGImage) -> CGImage {
+        guard ![.none, .noneSkipLast, .noneSkipFirst].contains(image.alphaInfo),
+              let space = image.colorSpace,
+              let context = CGContext(data: nil, width: image.width, height: image.height, bitsPerComponent: 8,
+                                      bytesPerRow: 0, space: space, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)
+        else { return image }
+        context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+        return context.makeImage() ?? image
     }
 
     /// `draft` trades demosaic quality for speed; fine at thumbnail size.
@@ -199,6 +214,12 @@ enum RawRenderer {
         }
 
         guard var image = raw.outputImage else { return nil }
+
+        // Crop first, so the vignette and grain are framed by the crop.
+        if let crop = settings.crop {
+            let rect = crop.rect(in: image.extent.size).offsetBy(dx: image.extent.minX, dy: image.extent.minY).integral
+            image = image.cropped(to: rect).transformed(by: CGAffineTransform(translationX: -rect.minX, y: -rect.minY))
+        }
 
         // Saturation isn't a RAW decode parameter, so it's applied afterwards.
         if settings.saturation != 1 {

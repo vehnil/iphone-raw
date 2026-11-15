@@ -5,11 +5,13 @@ import SwiftUI
 /// processed and will not match the RAW file exactly.
 struct CameraPreview: UIViewRepresentable {
     let session: AVCaptureSession
+    let handle: PreviewHandle
 
     func makeUIView(context: Context) -> PreviewView {
         let view = PreviewView()
         view.previewLayer.session = session
-        view.previewLayer.videoGravity = .resizeAspect
+        view.previewLayer.videoGravity = .resizeAspectFill
+        handle.layer = view.previewLayer
         return view
     }
 

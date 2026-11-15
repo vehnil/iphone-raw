@@ -1,5 +1,6 @@
 import AVFoundation
 
+
 /// What the current lens can deliver, for the capabilities screen.
 struct CaptureInfo {
     struct RawFormat: Identifiable {
@@ -13,6 +14,7 @@ struct CaptureInfo {
     var rawFormats: [RawFormat] = []
     var maxDimensions = "—"
     var proRAWSupported = false
+    var hasFlash = false
 
     var hasBayer: Bool { rawFormats.contains { $0.isBayer } }
 }
@@ -25,12 +27,17 @@ final class CameraController: NSObject, ObservableObject {
     @Published private(set) var lenses: [AVCaptureDevice] = []
     @Published private(set) var currentLens: AVCaptureDevice?
     @Published private(set) var info = CaptureInfo()
-    @Published private(set) var status = ""
-    @Published private(set) var isCapturing = false
+    @Published fileprivate(set) var status = ""
+    @Published fileprivate(set) var isCapturing = false
+    /// Goes up as each shot is taken, for the shutter blink.
+    @Published fileprivate(set) var shutterCount = 0
+    /// Goes up when the scene changes after a tap to focus and focus returns to automatic.
+    @Published private(set) var focusResets = 0
 
     private let output = AVCapturePhotoOutput()
     private let sessionQueue = DispatchQueue(label: "iphoneraw.session")
     private var input: AVCaptureDeviceInput?
+    private var subjectObserver: NSObjectProtocol?
 
     func start() {
         Task {
@@ -96,6 +103,12 @@ final class CameraController: NSObject, ObservableObject {
             }
             info.maxDimensions = "\(output.maxPhotoDimensions.width) × \(output.maxPhotoDimensions.height)"
             info.proRAWSupported = output.isAppleProRAWSupported
+            info.hasFlash = output.supportedFlashModes.contains(.on)
+
+            if let subjectObserver { NotificationCenter.default.removeObserver(subjectObserver) }
+            subjectObserver = NotificationCenter.default.addObserver(
+                forName: AVCaptureDevice.subjectAreaDidChangeNotification, object: device, queue: .main
+            ) { [weak self] _ in self?.subjectAreaChanged() }
 
             publish {
                 $0.currentLens = device
@@ -105,7 +118,56 @@ final class CameraController: NSObject, ObservableObject {
         }
     }
 
-    func capture() {
+    /// Focuses and meters at `point` (in device coordinates, 0–1). A lock holds
+    /// both once set; otherwise they follow the subject until the scene changes.
+    func focus(at point: CGPoint, lock: Bool) {
+        focus(at: point, lock: lock, watchSubject: !lock)
+    }
+
+    private func focus(at point: CGPoint, lock: Bool, watchSubject: Bool) {
+        sessionQueue.async { [self] in
+            guard let device = input?.device else { return }
+            configure(device) {
+                let focusMode: AVCaptureDevice.FocusMode = lock ? .autoFocus : .continuousAutoFocus
+                if device.isFocusPointOfInterestSupported, device.isFocusModeSupported(focusMode) {
+                    device.focusPointOfInterest = point
+                    device.focusMode = focusMode
+                }
+                // autoExpose meters once and then locks.
+                let exposureMode: AVCaptureDevice.ExposureMode = lock ? .autoExpose : .continuousAutoExposure
+                if device.isExposurePointOfInterestSupported, device.isExposureModeSupported(exposureMode) {
+                    device.exposurePointOfInterest = point
+                    device.exposureMode = exposureMode
+                }
+                device.setExposureTargetBias(0)
+                device.isSubjectAreaChangeMonitoringEnabled = watchSubject
+            }
+        }
+    }
+
+    /// Exposure compensation in EV. It changes the actual exposure, so the RAW gets it too.
+    func setExposureBias(_ bias: Float) {
+        sessionQueue.async { [self] in
+            guard let device = input?.device else { return }
+            configure(device) {
+                device.setExposureTargetBias(min(max(bias, device.minExposureTargetBias), device.maxExposureTargetBias))
+            }
+        }
+    }
+
+    private func subjectAreaChanged() {
+        // Back to automatic across the whole frame, as the Camera app does.
+        focus(at: CGPoint(x: 0.5, y: 0.5), lock: false, watchSubject: false)
+        focusResets += 1
+    }
+
+    private func configure(_ device: AVCaptureDevice, _ change: () -> Void) {
+        guard (try? device.lockForConfiguration()) != nil else { return }
+        change()
+        device.unlockForConfiguration()
+    }
+
+    func capture(flash: AVCaptureDevice.FlashMode, crop: CropAspect) {
         sessionQueue.async { [self] in
             guard let format = output.availableRawPhotoPixelFormatTypes
                 .first(where: AVCapturePhotoOutput.isBayerRAWPixelFormat) else {
@@ -117,36 +179,63 @@ final class CameraController: NSObject, ObservableObject {
             let settings = AVCapturePhotoSettings(rawPixelFormatType: format)
             settings.maxPhotoDimensions = output.maxPhotoDimensions
             settings.photoQualityPrioritization = .speed
-            settings.flashMode = .off
+            settings.flashMode = output.supportedFlashModes.contains(flash) ? flash : .off
 
-            publish { $0.isCapturing = true }
-            output.capturePhoto(with: settings, delegate: self)
+            publish {
+                $0.isCapturing = true
+                $0.status = ""
+            }
+            output.capturePhoto(with: settings, delegate: Capture(camera: self, crop: crop))
         }
     }
 
-    private func publish(_ update: @escaping (CameraController) -> Void) {
+    fileprivate func publish(_ update: @escaping (CameraController) -> Void) {
         DispatchQueue.main.async { update(self) }
     }
 }
 
-extension CameraController: AVCapturePhotoCaptureDelegate {
-    func photoOutput(_ output: AVCapturePhotoOutput, didFinishProcessingPhoto photo: AVCapturePhoto, error: Error?) {
-        defer { publish { $0.isCapturing = false } }
+/// One shot in flight. The output holds its delegate only weakly, so each
+/// capture keeps itself alive until it's done.
+private final class Capture: NSObject, AVCapturePhotoCaptureDelegate {
+    private static var inFlight: Set<Capture> = []
+    private static let lock = NSLock()
 
+    let camera: CameraController
+    let crop: CropAspect
+
+    init(camera: CameraController, crop: CropAspect) {
+        self.camera = camera
+        self.crop = crop
+        super.init()
+        Self.lock.withLock { _ = Self.inFlight.insert(self) }
+    }
+
+    func photoOutput(_ output: AVCapturePhotoOutput, willCapturePhotoFor resolvedSettings: AVCaptureResolvedPhotoSettings) {
+        camera.publish { $0.shutterCount += 1 }
+    }
+
+    func photoOutput(_ output: AVCapturePhotoOutput, didFinishProcessingPhoto photo: AVCapturePhoto, error: Error?) {
         if let error {
-            publish { $0.status = "Capture failed: \(error.localizedDescription)" }
+            camera.publish { $0.status = "Capture failed: \(error.localizedDescription)" }
             return
         }
         guard photo.isRawPhoto, let dng = photo.fileDataRepresentation(with: MetadataAllowlist()) else {
-            publish { $0.status = "Capture didn't return RAW data." }
+            camera.publish { $0.status = "Capture didn't return RAW data." }
             return
         }
-        save(dng)
+        camera.save(dng, crop: crop)
     }
 
+    func photoOutput(_ output: AVCapturePhotoOutput, didFinishCaptureFor resolvedSettings: AVCaptureResolvedPhotoSettings, error: Error?) {
+        camera.publish { $0.isCapturing = false }
+        Self.lock.withLock { _ = Self.inFlight.remove(self) }
+    }
+}
+
+extension CameraController {
     /// Writes the DNG to the app's Documents folder (visible in the Files app)
     /// and adds it to the photo library as a RAW + HEIC pair.
-    private func save(_ dng: Data) {
+    fileprivate func save(_ dng: Data, crop: CropAspect) {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyyMMdd_HHmmss"
         let name = "RAW_\(formatter.string(from: Date())).dng"
@@ -158,13 +247,18 @@ extension CameraController: AVCapturePhotoCaptureDelegate {
             publish { $0.status = "Couldn't write \(name): \(error.localizedDescription)" }
             return
         }
+        // A crop is the only setting a capture starts with; looks are added later.
+        var settings = DevelopSettings()
+        if crop != .fourThree {
+            settings.crop = crop
+            EditArchive.update { $0.photos[name] = settings }
+        }
         Task {
             // Photos develops a DNG with Apple's own processing when it displays it,
             // so it gets our neutral render to show, with the DNG attached as the RAW.
-            let rendered = await RawRenderer.export(url, settings: DevelopSettings(), as: .heic)
+            let rendered = await RawRenderer.export(url, settings: settings, as: .heic)
             do {
                 try await PhotosExport.saveRAW(url, rendered: rendered)
-                publish { $0.status = "Saved \(name)" }
             } catch is PhotosExport.NoAccess {
                 publish { $0.status = "Saved \(name) to Files (no Photos access)." }
             } catch {

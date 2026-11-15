@@ -13,6 +13,13 @@ struct EditArchive: Codable {
         return archive
     }
 
+    /// Changes the saved archive directly, for when no `EditStore` is open.
+    static func update(_ change: (inout EditArchive) -> Void) {
+        var archive = load()
+        change(&archive)
+        archive.save()
+    }
+
     func save() {
         try? FileManager.default.createDirectory(at: .applicationSupportDirectory, withIntermediateDirectories: true)
         try? JSONEncoder().encode(self).write(to: Self.url, options: .atomic)

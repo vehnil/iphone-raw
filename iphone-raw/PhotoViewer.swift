@@ -15,6 +15,7 @@ struct PhotoViewer: View {
     @State private var pager = ScrollPosition(idType: URL.self)
     /// Direction the current drag locked to, so one gesture can't both page and open the editor.
     @State private var dragAxis: Axis?
+    @State private var isZooming = false
     @State private var isExporting = false
     @State private var message: String?
 
@@ -23,7 +24,7 @@ struct PhotoViewer: View {
             ScrollView(.horizontal) {
                 LazyHStack(spacing: 0) {
                     ForEach(photos, id: \.self) { url in
-                        PhotoPage(url: url, settings: edits.settings(for: url))
+                        PhotoPage(url: url, settings: edits.settings(for: url), isZooming: $isZooming)
                             .containerRelativeFrame([.horizontal, .vertical])
                     }
                 }
@@ -31,7 +32,7 @@ struct PhotoViewer: View {
             }
             .scrollTargetBehavior(.paging)
             .scrollPosition($pager)
-            .scrollDisabled(dragAxis == .vertical)
+            .scrollDisabled(dragAxis == .vertical || isZooming)
             .scrollIndicators(.hidden)
             .background(Color.black)
             .overlay {
@@ -120,6 +121,7 @@ struct PhotoViewer: View {
     private var editorSwipe: some Gesture {
         DragGesture(minimumDistance: 10)
             .onChanged { value in
+                guard !isZooming else { return }
                 let dx = value.translation.width, dy = value.translation.height
                 if dragAxis == nil {
                     dragAxis = abs(dy) > abs(dx) ? .vertical : .horizontal
@@ -184,15 +186,27 @@ struct PhotoViewer: View {
     }
 }
 
-/// One photo, rendered with its settings. Shows the thumbnail while the full preview renders.
+/// One photo, rendered with its settings. Shows the thumbnail while the full
+/// preview renders. Pinch to zoom; letting go springs back, as in Photos.
 private struct PhotoPage: View {
     let url: URL
     let settings: DevelopSettings
+    @Binding var isZooming: Bool
     @State private var image: UIImage?
+    @State private var zoom: Zoom?
+    @State private var size = CGSize.zero
+    /// Set on the first pinch, so zooming in shows full-resolution detail.
+    @State private var wantsFullResolution = false
 
-    init(url: URL, settings: DevelopSettings) {
+    private struct RenderRequest: Equatable {
+        let settings: DevelopSettings
+        let fullResolution: Bool
+    }
+
+    init(url: URL, settings: DevelopSettings, isZooming: Binding<Bool>) {
         self.url = url
         self.settings = settings
+        _isZooming = isZooming
         // Start from a cached thumbnail so landing on a page never flashes empty.
         _image = State(initialValue: RawRenderer.cachedThumbnail(for: url, settings: settings))
     }
@@ -203,23 +217,77 @@ private struct PhotoPage: View {
         ZStack {
             if let image {
                 Image(uiImage: image).resizable().scaledToFit()
+                    .scaleEffect(zoom?.scale ?? 1)
+                    .offset(zoomOffset)
             } else {
                 ProgressView()
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .contentShape(Rectangle())
+        .gesture(PinchZoom(zoom: $zoom) { zooming in
+            isZooming = zooming
+            if zooming { wantsFullResolution = true }
+        })
+        .onGeometryChange(for: CGSize.self, of: \.size) { size = $0 }
+        .onChange(of: settings) { wantsFullResolution = false }
         .task {
             guard image == nil else { return }
             let thumbnail = await RawRenderer.thumbnail(for: url, settings: settings)
             if !hasFullRender { image = thumbnail }
         }
-        .task(id: settings) {
+        .task(id: RenderRequest(settings: settings, fullResolution: wantsFullResolution)) {
             // Short delay so dragging a slider doesn't queue a render per tick.
             try? await Task.sleep(for: .milliseconds(80))
             guard !Task.isCancelled else { return }
-            if let rendered = await RawRenderer.render(url, settings: settings, maxPixel: 2000) {
+            let maxPixel: CGFloat = wantsFullResolution ? .infinity : 2000
+            if let rendered = await RawRenderer.render(url, settings: settings, maxPixel: maxPixel) {
                 image = rendered
                 hasFullRender = true
             }
+        }
+    }
+
+    /// Keeps the point first pinched under the fingers as they move and spread.
+    private var zoomOffset: CGSize {
+        guard let zoom else { return .zero }
+        let center = CGPoint(x: size.width / 2, y: size.height / 2)
+        return CGSize(width: zoom.location.x - center.x - zoom.scale * (zoom.anchor.x - center.x),
+                      height: zoom.location.y - center.y - zoom.scale * (zoom.anchor.y - center.y))
+    }
+}
+
+private struct Zoom: Equatable {
+    /// Where the pinch started, and where the fingers are now.
+    var anchor: CGPoint
+    var location: CGPoint
+    var scale: CGFloat
+}
+
+/// UIKit's pinch, for the centre of the fingers, which SwiftUI's magnify gesture doesn't report.
+private struct PinchZoom: UIGestureRecognizerRepresentable {
+    @Binding var zoom: Zoom?
+    /// Called once when a pinch starts and once when it ends.
+    let onZooming: (Bool) -> Void
+
+    func makeUIGestureRecognizer(context: Context) -> UIPinchGestureRecognizer {
+        UIPinchGestureRecognizer()
+    }
+
+    func handleUIGestureRecognizerAction(_ recognizer: UIPinchGestureRecognizer, context: Context) {
+        let location = context.converter.localLocation
+        let scale = min(max(recognizer.scale, 0.5), 10)
+        switch recognizer.state {
+        case .began:
+            zoom = Zoom(anchor: location, location: location, scale: scale)
+            onZooming(true)
+        case .changed:
+            zoom?.scale = scale
+            // With one finger lifted the centre jumps to the other, so hold still.
+            if recognizer.numberOfTouches >= 2 { zoom?.location = location }
+        default:
+            withAnimation(.spring(duration: 0.35, bounce: 0.15)) { zoom = nil }
+            onZooming(false)
         }
     }
 }
