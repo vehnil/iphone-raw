@@ -1,5 +1,4 @@
 import AVFoundation
-import Photos
 
 /// What the current lens can deliver, for the capabilities screen.
 struct CaptureInfo {
@@ -146,7 +145,7 @@ extension CameraController: AVCapturePhotoCaptureDelegate {
     }
 
     /// Writes the DNG to the app's Documents folder (visible in the Files app)
-    /// and adds it to the photo library.
+    /// and adds it to the photo library as a RAW + HEIC pair.
     private func save(_ dng: Data) {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyyMMdd_HHmmss"
@@ -159,19 +158,15 @@ extension CameraController: AVCapturePhotoCaptureDelegate {
             publish { $0.status = "Couldn't write \(name): \(error.localizedDescription)" }
             return
         }
-        // On main, like the gallery's edits, so the two never write the archive at once.
-        DispatchQueue.main.async { EditArchive.startNewPhoto(named: name) }
-
         Task {
-            guard await PHPhotoLibrary.requestAuthorization(for: .addOnly) == .authorized else {
-                publish { $0.status = "Saved \(name) to Files (no Photos access)." }
-                return
-            }
+            // Photos develops a DNG with Apple's own processing when it displays it,
+            // so it gets our neutral render to show, with the DNG attached as the RAW.
+            let rendered = await RawRenderer.export(url, settings: DevelopSettings(), as: .heic)
             do {
-                try await PHPhotoLibrary.shared().performChanges {
-                    PHAssetCreationRequest.forAsset().addResource(with: .photo, fileURL: url, options: nil)
-                }
+                try await PhotosExport.saveRAW(url, rendered: rendered)
                 publish { $0.status = "Saved \(name)" }
+            } catch is PhotosExport.NoAccess {
+                publish { $0.status = "Saved \(name) to Files (no Photos access)." }
             } catch {
                 publish { $0.status = "Saved to Files, Photos failed: \(error.localizedDescription)" }
             }

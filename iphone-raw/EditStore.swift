@@ -39,12 +39,7 @@ final class EditStore: ObservableObject {
     }
 
     private func update(_ url: URL, _ settings: DevelopSettings) {
-        let previous = self.settings(for: url)
         archive.photos[url.lastPathComponent] = settings
-        if settings.film != previous.film || settings.filmPresetID != previous.filmPresetID {
-            archive.lastFilm = settings.film
-            archive.lastFilmPresetID = settings.filmPresetID
-        }
         scheduleSave()
     }
 
