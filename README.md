@@ -11,7 +11,7 @@ An iOS camera app that captures **Bayer RAW** DNGs — the sensor data before Ap
 
 ## Requirements
 
-- Physical iPhone running iOS 17+ (the simulator has no camera)
+- Physical iPhone running iOS 18+ (the simulator has no camera)
 - Xcode 16+
 
 ## Build
