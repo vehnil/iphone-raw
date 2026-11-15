@@ -12,6 +12,9 @@ struct PhotoViewer: View {
     @State private var showingEditor = false
     /// The photo under the filmstrip's centre while scrubbing; the pager only moves when scrubbing ends.
     @State private var scrubbed: URL?
+    @State private var pager = ScrollPosition(idType: URL.self)
+    /// Direction the current drag locked to, so one gesture can't both page and open the editor.
+    @State private var dragAxis: Axis?
     @State private var isExporting = false
     @State private var message: String?
 
@@ -27,7 +30,8 @@ struct PhotoViewer: View {
                 .scrollTargetLayout()
             }
             .scrollTargetBehavior(.paging)
-            .scrollPosition(id: $current)
+            .scrollPosition($pager)
+            .scrollDisabled(dragAxis == .vertical)
             .scrollIndicators(.hidden)
             .background(Color.black)
             .overlay {
@@ -35,7 +39,6 @@ struct PhotoViewer: View {
                     ScrubPreview(url: scrubbed, settings: edits.settings(for: scrubbed))
                 }
             }
-            .simultaneousGesture(editorSwipe)
 
             if showingEditor, let current {
                 EditPanel(url: current, edits: edits)
@@ -43,10 +46,24 @@ struct PhotoViewer: View {
                     .background(.bar)
                     .transition(.move(edge: .bottom))
             } else {
-                Filmstrip(photos: photos, current: $current, scrubbed: $scrubbed, edits: edits)
+                Filmstrip(photos: photos, settings: photos.map(edits.settings(for:)), current: current,
+                          onScrub: { scrubbed = $0 }, onSelect: { current = $0 })
+                    .frame(height: FilmstripLayout.height)
                     .padding(.vertical, 6)
             }
         }
+        // On the whole viewer, so a downward swipe over the edit panel closes it too.
+        .simultaneousGesture(editorSwipe)
+        .onAppear {
+            if let current { pager.scrollTo(id: current) }
+        }
+        .onChange(of: pager.viewID(type: URL.self)) { _, url in
+            if let url, url != current { current = url }
+        }
+        .onChange(of: current) { _, url in
+            if let url, url != pager.viewID(type: URL.self) { pager.scrollTo(id: url) }
+        }
+        .task(id: current) { await prefetchThumbnails(around: current) }
         .overlay(alignment: .top) {
             if let message {
                 Text(message)
@@ -97,18 +114,40 @@ struct PhotoViewer: View {
         }
     }
 
-    /// Vertical swipes on the photo open (up) or close (down) the editor;
-    /// horizontal ones are left to the pager.
+    /// Swiping up opens the editor and down closes it, as soon as the drag has
+    /// moved far enough. A drag locks to its first direction: vertical ones stop
+    /// the pager (and put it back on the photo), horizontal ones are left alone.
     private var editorSwipe: some Gesture {
-        DragGesture(minimumDistance: 30).onEnded { value in
-            let dx = value.translation.width, dy = value.translation.height
-            guard abs(dy) > abs(dx) * 1.5 else { return }
-            setEditor(dy < 0)
+        DragGesture(minimumDistance: 10)
+            .onChanged { value in
+                let dx = value.translation.width, dy = value.translation.height
+                if dragAxis == nil {
+                    dragAxis = abs(dy) > abs(dx) ? .vertical : .horizontal
+                }
+                guard dragAxis == .vertical else { return }
+                if dy < -24, !showingEditor { setEditor(true) }
+                if dy > 24, showingEditor { setEditor(false) }
+            }
+            .onEnded { _ in
+                if dragAxis == .vertical, let current {
+                    withAnimation(.snappy) { pager.scrollTo(id: current) }
+                }
+                dragAxis = nil
+            }
+    }
+
+    /// Warms thumbnails nearest the current photo first, so scrubbing finds them ready.
+    private func prefetchThumbnails(around url: URL?) async {
+        guard let url, let center = photos.firstIndex(of: url) else { return }
+        let nearby = photos.indices.sorted { abs($0 - center) < abs($1 - center) }.prefix(40)
+        for index in nearby {
+            guard !Task.isCancelled else { return }
+            _ = await RawRenderer.thumbnail(for: photos[index], settings: edits.settings(for: photos[index]))
         }
     }
 
     private func setEditor(_ visible: Bool) {
-        withAnimation(.snappy) { showingEditor = visible }
+        withAnimation(.snappy(duration: 0.25)) { showingEditor = visible }
     }
 
     private func export(_ url: URL, as format: ExportFormat) {
@@ -182,137 +221,6 @@ private struct PhotoPage: View {
                 hasFullRender = true
             }
         }
-    }
-}
-
-/// Photos-style scrubber: narrow slices of every photo, with the current one
-/// expanded to its real shape. Every slice takes the same space in the layout
-/// (the expanded one is drawn on top), so the slice under the centre is always
-/// `offset / pitch` — exact even mid-fling. While scrubbing it reports that
-/// photo through `scrubbed`; letting go makes it `current`.
-private struct Filmstrip: View {
-    let photos: [URL]
-    @Binding var current: URL?
-    @Binding var scrubbed: URL?
-    @ObservedObject var edits: EditStore
-
-    @State private var isScrubbing = false
-
-    static let height: CGFloat = 42
-    static let sliceWidth: CGFloat = 22
-    private static let spacing: CGFloat = 2
-    private static let pitch = sliceWidth + spacing
-
-    var body: some View {
-        GeometryReader { proxy in
-            ScrollViewReader { reader in
-                ScrollView(.horizontal) {
-                    LazyHStack(spacing: Self.spacing) {
-                        ForEach(photos, id: \.self) { url in
-                            let expanded = url == current && !isScrubbing
-                            StripThumbnail(url: url, settings: edits.settings(for: url), expanded: expanded)
-                                .zIndex(expanded ? 1 : 0)
-                                .id(url)
-                                .onTapGesture { current = url }
-                        }
-                    }
-                    // Lets the first and last photos reach the centre.
-                    .padding(.horizontal, max(0, (proxy.size.width - Self.sliceWidth) / 2))
-                }
-                .scrollIndicators(.hidden)
-                .scrollTargetBehavior(SliceSnapping(pitch: Self.pitch))
-                .onScrollPhaseChange { _, phase in
-                    let scrubbing = phase == .tracking || phase == .interacting || phase == .decelerating
-                    guard scrubbing != isScrubbing else { return }
-                    withAnimation(.snappy(duration: 0.2)) { isScrubbing = scrubbing }
-                    if !scrubbing, let scrubbed {
-                        current = scrubbed
-                        self.scrubbed = nil
-                    }
-                }
-                .onScrollGeometryChange(for: Int.self) { geometry in
-                    Int((geometry.contentOffset.x / Self.pitch).rounded())
-                } action: { _, index in
-                    guard isScrubbing, !photos.isEmpty else { return }
-                    let url = photos[min(max(index, 0), photos.count - 1)]
-                    if url != scrubbed { scrubbed = url }
-                }
-                .onChange(of: current) { _, url in
-                    guard !isScrubbing, let url else { return }
-                    withAnimation(.snappy) { reader.scrollTo(url, anchor: .center) }
-                }
-                .onAppear {
-                    if let current { reader.scrollTo(current, anchor: .center) }
-                }
-            }
-        }
-        .frame(height: Self.height)
-        .sensoryFeedback(.selection, trigger: scrubbed) { _, new in new != nil }
-        .task(id: current) { await prefetch(around: current) }
-    }
-
-    /// Warms thumbnails nearest the current photo first, so scrubbing finds them ready.
-    private func prefetch(around url: URL?) async {
-        guard let url, let center = photos.firstIndex(of: url) else { return }
-        let nearby = photos.indices
-            .sorted { abs($0 - center) < abs($1 - center) }
-            .prefix(40)
-        for index in nearby {
-            guard !Task.isCancelled else { return }
-            let photo = photos[index]
-            _ = await RawRenderer.thumbnail(for: photo, settings: edits.settings(for: photo))
-        }
-    }
-}
-
-/// Snaps a fling so a slice ends up centred.
-private struct SliceSnapping: ScrollTargetBehavior {
-    let pitch: CGFloat
-
-    func updateTarget(_ target: inout ScrollTarget, context: TargetContext) {
-        target.rect.origin.x = (target.rect.minX / pitch).rounded() * pitch
-    }
-}
-
-private struct StripThumbnail: View {
-    let url: URL
-    let settings: DevelopSettings
-    let expanded: Bool
-    @State private var image: UIImage?
-
-    private var expandedWidth: CGFloat {
-        let aspect = image.map { $0.size.width / $0.size.height } ?? 0.75
-        return Filmstrip.height * aspect
-    }
-
-    var body: some View {
-        thumbnail(width: Filmstrip.sliceWidth)
-            .overlay {
-                if expanded {
-                    // Drawn over the neighbours; the black edge reads as a gap around it.
-                    thumbnail(width: expandedWidth)
-                        .padding(.horizontal, 3)
-                        .background(Color.black)
-                        .fixedSize()
-                        .transition(.opacity)
-                }
-            }
-            .task(id: settings) {
-                if let rendered = await RawRenderer.thumbnail(for: url, settings: settings) {
-                    image = rendered
-                }
-            }
-    }
-
-    private func thumbnail(width: CGFloat) -> some View {
-        Color.gray.opacity(0.2)
-            .overlay {
-                if let image {
-                    Image(uiImage: image).resizable().scaledToFill()
-                }
-            }
-            .frame(width: width, height: Filmstrip.height)
-            .clipShape(RoundedRectangle(cornerRadius: 2))
     }
 }
 
