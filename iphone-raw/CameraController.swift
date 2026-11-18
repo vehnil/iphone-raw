@@ -287,7 +287,7 @@ extension CameraController {
         var settings = DevelopSettings()
         if crop != .fourThree {
             settings.crop = crop
-            EditArchive.update { $0.photos[name] = settings }
+            EditArchive.shared.set(settings, for: name)
         }
         Task {
             // Photos develops a DNG with Apple's own processing when it displays it,

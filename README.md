@@ -25,3 +25,16 @@ An iOS camera app that captures **Bayer RAW** DNGs — the sensor data before Ap
 
 - The live viewfinder comes from the video pipeline, so it's processed and won't match the RAW file.
 - Lens shading and distortion corrections are stored as DNG opcodes rather than applied; RAW editors may apply them on import.
+
+## Film Lab
+
+For testing film looks without reference film scans.
+
+- **In the app:** the flask button on a photo (or *Settings › Film Lab* on the camera) compares two configurations on that photo or on synthetic test charts: wipe, split or flip, every pipeline stage switchable, a response-curve plot, and double-tap for a full-resolution crop. Configurations can be saved; saved ones with a look also appear in the editor's Film tab.
+- **On the Mac:** `Tools/contact-sheet.sh` renders DNGs and charts through configurations into one labelled image, using the app's own develop and film code:
+
+  ```sh
+  Tools/contact-sheet.sh -o sheet.jpg                    # all charts × built-in looks
+  Tools/contact-sheet.sh -c lab-configs.json photo.dng   # configs exported from the Lab
+  Tools/contact-sheet.sh --stages colour,tone charts     # only some stages
+  ```

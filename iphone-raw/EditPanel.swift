@@ -87,8 +87,19 @@ private struct DevelopControls: View {
 private struct FilmControls: View {
     let url: URL
     @Binding var settings: DevelopSettings
-    /// Chip previews: "Off" first, then each preset.
+    @ObservedObject private var lab = LabStore.shared
+    /// Chip previews: "Off" first, then each look.
     @State private var previews: [UIImage?] = []
+
+    private struct PreviewKey: Equatable {
+        let settings: DevelopSettings
+        let looks: [FilmLook]
+    }
+
+    /// The built-in looks, then those saved in the Lab.
+    private var looks: [(id: String, name: String, look: FilmLook)] {
+        FilmLook.presets.map { ($0.id, $0.name, $0.look) } + lab.savedLooks
+    }
 
     var body: some View {
         VStack(spacing: 8) {
@@ -98,7 +109,7 @@ private struct FilmControls: View {
                         settings.film = nil
                         settings.filmPresetID = nil
                     }
-                    ForEach(Array(FilmLook.presets.enumerated()), id: \.element.id) { index, preset in
+                    ForEach(Array(looks.enumerated()), id: \.element.id) { index, preset in
                         LookChip(name: preset.name, image: preview(index + 1),
                                  isSelected: settings.filmPresetID == preset.id) {
                             settings.film = preset.look
@@ -109,9 +120,9 @@ private struct FilmControls: View {
             }
             .scrollIndicators(.hidden)
             // Previews only depend on the develop settings: the look sliders don't change them.
-            .task(id: with(nil)) {
+            .task(id: PreviewKey(settings: with(nil), looks: looks.map(\.look))) {
                 previews = await RawRenderer.lookPreviews(url, settings: with(nil),
-                                                          looks: [nil] + FilmLook.presets.map(\.look), maxPixel: 160)
+                                                          looks: [nil] + looks.map(\.look), maxPixel: 160)
             }
 
             if settings.film != nil {

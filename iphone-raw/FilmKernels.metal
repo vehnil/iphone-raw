@@ -67,14 +67,19 @@ float4 filmGrain(sample_t s, sample_t fine, sample_t coarse, float amount) {
     return float4(srgbToLinear(saturate(d)), s.a);
 }
 
-/// Adds `light` (bloom) to the image in linear light, keeping the image's
-/// alpha. Built-in addition would add the alphas too.
-float4 addLight(sample_t s, sample_t light) {
-    return float4(s.rgb + light.rgb, s.a);
+/// The light a pixel scatters (halation, bloom): `amount` of its luminance,
+/// tinted. Where every channel clipped, the scene was brighter than the RAW
+/// could record, so that light counts `clipGain` times over. A single clipped
+/// channel (a bright warm wall) doesn't count: it isn't a light source.
+float4 scatterSource(sample_t s, float3 tint, float amount, float clipGain) {
+    float l = max(dot(s.rgb, kLuma), 0.0);
+    float clipped = smoothstep(0.95, 0.99, min(min(s.r, s.g), s.b));
+    return float4(tint * amount * l * (1.0 + clipGain * clipped), 1.0);
 }
 
-/// Adds only the light that `blurred` spreads beyond `source` (halation): a
-/// halo around highlights, leaving the inside of a large bright area its own colour.
+/// Adds only the light that `blurred` spreads beyond `source`: a glow from
+/// bright into darker areas, leaving flat areas and the inside of a large
+/// bright area unchanged.
 float4 addHalo(sample_t s, sample_t blurred, sample_t source) {
     return float4(s.rgb + max(blurred.rgb - source.rgb, 0.0), s.a);
 }

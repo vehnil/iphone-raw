@@ -1,6 +1,7 @@
 import CoreImage
 import CoreImage.CIFilterBuiltins
 import ImageIO
+import OSLog
 import UIKit
 import UniformTypeIdentifiers
 
@@ -13,42 +14,9 @@ enum ExportFormat: String, CaseIterable, Identifiable {
     var type: UTType { self == .heic ? .heic : .jpeg }
 }
 
-/// User-adjustable development of a Bayer DNG. The defaults are "neutral":
-/// none of Apple's look (boost, local tone mapping, sharpening, noise
-/// reduction, lens correction) is applied.
-struct DevelopSettings: Codable, Equatable {
-    var exposure: Float = 0
-    /// Kelvin. `nil` means the as-shot white balance stored in the DNG.
-    var temperature: Float?
-    var tint: Float?
-    var saturation: Float = 1
-    var appleLook = false
-    var lensCorrection = false
-    var film: FilmLook?
-    /// The preset `film` started from, for highlighting it in the UI.
-    var filmPresetID: String?
-    /// `nil` is the full 4:3 frame.
-    var crop: CropAspect?
-}
-
-extension DevelopSettings {
-    /// Missing keys fall back to defaults, so saved edits survive new settings being added.
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        let d = DevelopSettings()
-        exposure = try c.decodeIfPresent(Float.self, forKey: .exposure) ?? d.exposure
-        temperature = try c.decodeIfPresent(Float.self, forKey: .temperature)
-        tint = try c.decodeIfPresent(Float.self, forKey: .tint)
-        saturation = try c.decodeIfPresent(Float.self, forKey: .saturation) ?? d.saturation
-        appleLook = try c.decodeIfPresent(Bool.self, forKey: .appleLook) ?? d.appleLook
-        lensCorrection = try c.decodeIfPresent(Bool.self, forKey: .lensCorrection) ?? d.lensCorrection
-        film = try c.decodeIfPresent(FilmLook.self, forKey: .film)
-        filmPresetID = try c.decodeIfPresent(String.self, forKey: .filmPresetID)
-        crop = try? c.decodeIfPresent(CropAspect.self, forKey: .crop)
-    }
-}
-
 enum RawRenderer {
+    /// Timings for finding what's slow; in Xcode's console, filter by "perf".
+    static let perf = Logger(subsystem: "iphone-raw", category: "perf")
     enum Priority {
         /// Grid thumbnails and look previews.
         case thumbnail
@@ -81,6 +49,10 @@ enum RawRenderer {
     // opening a photo doesn't wait behind a grid of thumbnails.
     private static let thumbnailQueue = DispatchQueue(label: "iphoneraw.thumbnails", qos: .utility)
     private static let previewQueue = DispatchQueue(label: "iphoneraw.preview", qos: .userInitiated)
+    /// Warming ahead of the gallery runs here, below anything the gallery asks for.
+    private static let warmQueue = DispatchQueue(label: "iphoneraw.thumbnails.warm", qos: .background)
+    /// Long edge of thumbnails, in pixels.
+    private static let thumbnailSize: CGFloat = 400
 
     /// Neutral settings with the white balance the camera recorded.
     static func asShotSettings(for url: URL) async -> DevelopSettings? {
@@ -97,30 +69,87 @@ enum RawRenderer {
 
     /// Memory, then disk, then a fresh (draft-quality) RAW decode.
     static func thumbnail(for url: URL, settings: DevelopSettings = DevelopSettings()) async -> UIImage? {
+        await thumbnail(for: url, settings: settings, disk: diskQueue, decode: thumbnailQueue, keep: true)
+    }
+
+    /// Gets thumbnails ready before the gallery opens, in order: the first
+    /// `inMemory` loaded into memory (from disk where cached), and any missing
+    /// from disk decoded and saved. One at a time at background priority, so
+    /// it stays out of the way of the camera and of the gallery itself.
+    static func warmThumbnails(_ photos: [(url: URL, settings: DevelopSettings)], inMemory: Int) async {
+        let start = Date()
+        perf.info("warm-up: started, \(photos.count) photos")
+        defer { perf.info("warm-up: stopped after \(Self.ms(since: start)) ms") }
+        for (index, photo) in photos.enumerated() {
+            guard !Task.isCancelled else { return }
+            if index % 20 == 0 { perf.info("warm-up: at photo \(index), \(Self.ms(since: start)) ms") }
+            let keep = index < inMemory
+            let key = cacheKey(photo.url, photo.settings)
+            if !keep, FileManager.default.fileExists(atPath: thumbnailFile(photo.url, key: key).path) { continue }
+            _ = await thumbnail(for: photo.url, settings: photo.settings, disk: warmQueue, decode: warmQueue, keep: keep)
+        }
+    }
+
+    /// `keep` puts the result in the memory cache.
+    private static func thumbnail(for url: URL, settings: DevelopSettings,
+                                  disk: DispatchQueue, decode: DispatchQueue, keep: Bool) async -> UIImage? {
         let key = cacheKey(url, settings)
         if let cached = thumbnails.object(forKey: key) { return cached }
 
-        let file = thumbnailDirectory.appending(path: url.lastPathComponent).appending(path: "\(fnv1a(key as String)).jpg")
-        var image = await run(on: diskQueue) {
+        let start = Date()
+        let file = thumbnailFile(url, key: key)
+        var image = await run(on: disk) {
             let image = (try? Data(contentsOf: file)).flatMap(UIImage.init(data:))?.preparingForDisplay()
             // Marks it recently used, for trimming.
             if image != nil { try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: file.path) }
             return image
         }
         if image == nil {
-            image = await run(on: thumbnailQueue) {
-                renderSync(url, settings: settings, maxPixel: 400, draft: true)
+            image = await run(on: decode) {
+                renderSync(url, settings: settings, maxPixel: thumbnailSize, draft: true)
             }
-            if let data = image?.jpegData(compressionQuality: 0.85) {
-                try? FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
-                try? data.write(to: file)
-            }
+            if let image { save(image, to: file) }
+            perf.info("thumbnail \(url.lastPathComponent): decoded, \(Self.ms(since: start)) ms (\(decode.label))")
+        } else {
+            perf.info("thumbnail \(url.lastPathComponent): from disk, \(Self.ms(since: start)) ms")
         }
-        if let image {
-            thumbnails.setObject(image, forKey: key, cost: Int(image.size.width * image.size.height * image.scale * image.scale * 4))
-            memoryKeysLock.withLock { _ = memoryKeys[url.lastPathComponent, default: []].insert(key) }
-        }
+        if let image, keep { remember(image, key: key, url: url) }
         return image
+    }
+
+    private static func thumbnailFile(_ url: URL, key: NSString) -> URL {
+        thumbnailDirectory.appending(path: url.lastPathComponent).appending(path: "\(Develop.hash(key as String)).jpg")
+    }
+
+    private static func save(_ thumbnail: UIImage, to file: URL) {
+        guard let data = thumbnail.jpegData(compressionQuality: 0.85) else { return }
+        try? FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? data.write(to: file)
+    }
+
+    private static func remember(_ thumbnail: UIImage, key: NSString, url: URL) {
+        thumbnails.setObject(thumbnail, forKey: key, cost: Int(thumbnail.size.width * thumbnail.size.height * thumbnail.scale * thumbnail.scale * 4))
+        memoryKeysLock.withLock { _ = memoryKeys[url.lastPathComponent, default: []].insert(key) }
+    }
+
+    /// Keeps a thumbnail of a render that's already been made (a capture's
+    /// HEIC for Photos, an export), so the gallery doesn't decode the RAW again.
+    private static func storeThumbnail(from image: CGImage, for url: URL, settings: DevelopSettings) {
+        let scale = min(1, thumbnailSize / CGFloat(max(image.width, image.height)))
+        let width = max(1, Int((CGFloat(image.width) * scale).rounded()))
+        let height = max(1, Int((CGFloat(image.height) * scale).rounded()))
+        guard let space = CGColorSpace(name: CGColorSpace.sRGB),
+              let bitmap = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8,
+                                     bytesPerRow: 0, space: space, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)
+        else { return }
+        bitmap.interpolationQuality = .high
+        bitmap.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+        guard let small = bitmap.makeImage() else { return }
+
+        let thumbnail = UIImage(cgImage: small)
+        let key = cacheKey(url, settings)
+        save(thumbnail, to: thumbnailFile(url, key: key))
+        remember(thumbnail, key: key, url: url)
     }
 
     static func removeCachedThumbnails(for url: URL) {
@@ -158,9 +187,16 @@ enum RawRenderer {
     }
 
     static func render(_ url: URL, settings: DevelopSettings, maxPixel: CGFloat, priority: Priority = .preview) async -> UIImage? {
-        await run(on: priority == .preview ? previewQueue : thumbnailQueue) {
+        let start = Date()
+        let image = await run(on: priority == .preview ? previewQueue : thumbnailQueue) {
             renderSync(url, settings: settings, maxPixel: maxPixel)
         }
+        perf.info("render \(url.lastPathComponent) at \(maxPixel == .infinity ? "full" : "\(Int(maxPixel))") px: \(Self.ms(since: start)) ms, waiting included")
+        return image
+    }
+
+    private static func ms(since start: Date) -> Int {
+        Int(Date().timeIntervalSince(start) * 1000)
     }
 
     /// Runs `work` on `queue`, skipping it if the calling task was cancelled
@@ -176,14 +212,19 @@ enum RawRenderer {
         }
     }
 
-    /// Bump when rendering changes, so cached thumbnails are made again.
-    /// 2: grain, halation and bloom render (they were blank before).
-    /// 3: halation and bloom thresholds work with clipped highlights.
-    private static let renderVersion = 3
+    /// Bump when rendering changes, so cached thumbnails are made again. Kept
+    /// apart so a change to the looks doesn't remake every neutral thumbnail.
+    /// Neutral 3 (versions before it were shared).
+    private static let neutralRenderVersion = 3
+    /// Film 2: grain, halation and bloom render. 3: halation and bloom work with
+    /// clipped highlights. 4: halation and bloom tuned on real photos. 5: halation
+    /// and bloom scatter a share of all light, with no threshold.
+    private static let filmRenderVersion = 5
 
     private static func cacheKey(_ url: URL, _ settings: DevelopSettings) -> NSString {
         let encoded = (try? JSONEncoder().encode(settings)).map { String(decoding: $0, as: UTF8.self) } ?? ""
-        return "\(url.lastPathComponent)|v\(renderVersion)|\(encoded)" as NSString
+        let version = settings.film == nil ? neutralRenderVersion : filmRenderVersion
+        return "\(url.lastPathComponent)|v\(version)|\(encoded)" as NSString
     }
 
     private static func renderSync(_ url: URL, settings: DevelopSettings, maxPixel: CGFloat, draft: Bool = false) -> UIImage? {
@@ -194,6 +235,7 @@ enum RawRenderer {
     static func export(_ url: URL, settings: DevelopSettings, as format: ExportFormat) async -> Data? {
         await run(on: previewQueue) {
             guard let image = renderCGImage(url, settings: settings, maxPixel: .infinity) else { return nil }
+            storeThumbnail(from: image, for: url, settings: settings)
             return encode(image, as: format, source: url)
         }
     }
@@ -237,9 +279,9 @@ enum RawRenderer {
 
     /// `draft` trades demosaic quality for speed; fine at thumbnail size.
     private static func renderCGImage(_ url: URL, settings: DevelopSettings, maxPixel: CGFloat, draft: Bool = false) -> CGImage? {
-        guard var image = developed(url, settings: settings, maxPixel: maxPixel, draft: draft) else { return nil }
+        guard var image = Develop.image(url, settings: settings, maxPixel: maxPixel, draft: draft) else { return nil }
         if let film = settings.film {
-            image = FilmPipeline.apply(film, to: image, seed: fnv1a(url.lastPathComponent))
+            image = FilmPipeline.apply(film, to: image, seed: Develop.hash(url.lastPathComponent))
         }
         return context.createCGImage(image, from: image.extent)
     }
@@ -250,13 +292,13 @@ enum RawRenderer {
         await run(on: thumbnailQueue) {
             var neutral = settings
             neutral.film = nil
-            guard let decoded = developed(url, settings: neutral, maxPixel: maxPixel, draft: true),
+            guard let decoded = Develop.image(url, settings: neutral, maxPixel: maxPixel, draft: true),
                   let linear = CGColorSpace(name: CGColorSpace.extendedLinearSRGB),
                   let bitmap = context.createCGImage(decoded, from: decoded.extent, format: .RGBAh, colorSpace: linear)
             else { return nil }
             // Rendered to a float bitmap so the looks reuse it instead of each re-running the decode.
             let base = CIImage(cgImage: bitmap)
-            let seed = fnv1a(url.lastPathComponent)
+            let seed = Develop.hash(url.lastPathComponent)
             return looks.map { look in
                 let image = look.map { FilmPipeline.apply($0, to: base, seed: seed) } ?? base
                 return context.createCGImage(image, from: image.extent).map(UIImage.init(cgImage:))
@@ -264,53 +306,6 @@ enum RawRenderer {
         } ?? looks.map { _ in nil }
     }
 
-    /// The RAW decoded with `settings`, cropped and saturated, before any film look.
-    private static func developed(_ url: URL, settings: DevelopSettings, maxPixel: CGFloat, draft: Bool) -> CIImage? {
-        guard let raw = CIRAWFilter(imageURL: url) else { return nil }
-
-        let longest = max(raw.nativeSize.width, raw.nativeSize.height)
-        if longest > maxPixel { raw.scaleFactor = Float(maxPixel / longest) }
-        raw.isDraftModeEnabled = draft
-
-        raw.exposure = settings.exposure
-        if let temperature = settings.temperature { raw.neutralTemperature = temperature }
-        if let tint = settings.tint { raw.neutralTint = tint }
-        if raw.isLensCorrectionSupported { raw.isLensCorrectionEnabled = settings.lensCorrection }
-
-        if !settings.appleLook {
-            raw.boostAmount = 0
-            raw.boostShadowAmount = 0
-            if raw.isLocalToneMapSupported { raw.localToneMapAmount = 0 }
-            if raw.isSharpnessSupported { raw.sharpnessAmount = 0 }
-            if raw.isLuminanceNoiseReductionSupported { raw.luminanceNoiseReductionAmount = 0 }
-            // Colour noise blotches look digital, not like film, so film looks keep
-            // Apple's colour noise reduction; grain replaces the luminance noise.
-            if raw.isColorNoiseReductionSupported && settings.film == nil { raw.colorNoiseReductionAmount = 0 }
-        }
-
-        guard var image = raw.outputImage else { return nil }
-
-        // Crop first, so the vignette and grain are framed by the crop.
-        if let crop = settings.crop {
-            let rect = crop.rect(in: image.extent.size).offsetBy(dx: image.extent.minX, dy: image.extent.minY).integral
-            image = image.cropped(to: rect).transformed(by: CGAffineTransform(translationX: -rect.minX, y: -rect.minY))
-        }
-
-        // Saturation isn't a RAW decode parameter, so it's applied afterwards.
-        if settings.saturation != 1 {
-            let controls = CIFilter.colorControls()
-            controls.inputImage = image
-            controls.saturation = settings.saturation
-            image = controls.outputImage ?? image
-        }
-        return image
-    }
-
-    /// Stable hash (FNV-1a): the per-photo grain seed, so grain doesn't change
-    /// between renders, and thumbnail cache file names.
-    private static func fnv1a(_ string: String) -> UInt64 {
-        string.utf8.reduce(14695981039346656037) { ($0 ^ UInt64($1)) &* 1099511628211 }
-    }
 }
 
 private final class CancellationFlag: @unchecked Sendable {
@@ -319,4 +314,99 @@ private final class CancellationFlag: @unchecked Sendable {
 
     var isSet: Bool { lock.withLock { value } }
     func set() { lock.withLock { value = true } }
+}
+
+// MARK: Lab
+
+/// What the Lab is looking at.
+enum LabSource: Hashable {
+    case photo(URL)
+    case chart(TestChart)
+
+    var name: String {
+        switch self {
+        case .photo: "This photo"
+        case .chart(let chart): chart.name
+        }
+    }
+}
+
+extension RawRenderer {
+    /// Bases (develop done, before the look) for the Lab, so switching looks or
+    /// stages doesn't decode the RAW again. Used on `previewQueue` only.
+    private static var labBases: [(key: String, image: CIImage)] = []
+
+    /// `source` rendered with each of `configs` and `stages`. `region` (0–1,
+    /// top-left origin) crops the result, for the Lab's detail view.
+    static func labRender(_ source: LabSource, configs: [DevelopSettings], stages: FilmPipeline.Stages,
+                          maxPixel: CGFloat, region: CGRect?) async -> [UIImage?] {
+        await run(on: previewQueue) {
+            configs.map { settings -> UIImage? in
+                guard var image = labBase(source, settings: settings, maxPixel: maxPixel) else { return nil }
+                if let film = settings.film {
+                    image = FilmPipeline.apply(film, to: image, seed: labSeed(source), stages: stages)
+                }
+                if let region {
+                    let e = image.extent
+                    let rect = CGRect(x: e.minX + region.minX * e.width, y: e.maxY - region.maxY * e.height,
+                                      width: region.width * e.width, height: region.height * e.height).integral
+                    image = image.cropped(to: rect)
+                }
+                return context.createCGImage(image, from: image.extent).map(UIImage.init(cgImage:))
+            }
+        } ?? configs.map { _ in nil }
+    }
+
+    /// Each configuration's response to mid grey from −8 to +4 EV, as display
+    /// values, `samples` points. Spatial stages (vignette, glows, grain) are left out.
+    static func labCurves(configs: [DevelopSettings], stages: FilmPipeline.Stages, samples: Int) async -> [[SIMD3<Float>]] {
+        await run(on: thumbnailQueue) {
+            let ramp = TestChart.exposureRamp(samples: samples, stops: labCurveStops)
+            let display = CGColorSpace(name: CGColorSpace.extendedSRGB)!
+            return configs.map { settings in
+                var image = ramp.applyingFilter("CIExposureAdjust", parameters: [kCIInputEVKey: settings.exposure])
+                if let film = settings.film {
+                    image = FilmPipeline.apply(film, to: image, stages: stages.intersection([.color, .tone]))
+                }
+                var pixels = [Float](repeating: 0, count: samples * 4)
+                context.render(image, toBitmap: &pixels, rowBytes: samples * 16, bounds: ramp.extent,
+                               format: .RGBAf, colorSpace: display)
+                return (0..<samples).map { SIMD3(pixels[$0 * 4], pixels[$0 * 4 + 1], pixels[$0 * 4 + 2]) }
+            }
+        } ?? []
+    }
+
+    static let labCurveStops: ClosedRange<Double> = -8...4
+
+    private static func labSeed(_ source: LabSource) -> UInt64 {
+        switch source {
+        case .photo(let url): Develop.hash(url.lastPathComponent)
+        case .chart(let chart): Develop.hash(chart.rawValue)
+        }
+    }
+
+    private static func labBase(_ source: LabSource, settings: DevelopSettings, maxPixel: CGFloat) -> CIImage? {
+        switch source {
+        case .chart(let chart):
+            // Cheap to make; charts aren't cached.
+            return Develop.chart(chart, settings: settings, longEdge: min(maxPixel, 2400))
+        case .photo(let url):
+            // Only whether there's a look matters to the decode (colour noise reduction).
+            var develop = settings
+            develop.film = settings.film == nil ? nil : FilmLook()
+            develop.filmPresetID = nil
+            let encoded = (try? JSONEncoder().encode(develop)).map { String(decoding: $0, as: UTF8.self) } ?? ""
+            let key = "\(url.lastPathComponent)|\(maxPixel)|\(encoded)"
+            if let cached = labBases.first(where: { $0.key == key }) { return cached.image }
+
+            guard let decoded = Develop.image(url, settings: develop, maxPixel: maxPixel, draft: false),
+                  let bitmap = context.createCGImage(decoded, from: decoded.extent, format: .RGBAh, colorSpace: TestChart.linear)
+            else { return nil }
+            let image = CIImage(cgImage: bitmap)
+            // Two is enough for A and B; full-resolution bases are large.
+            labBases.append((key, image))
+            if labBases.count > 2 { labBases.removeFirst() }
+            return image
+        }
+    }
 }

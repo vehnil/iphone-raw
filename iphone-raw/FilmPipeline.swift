@@ -13,40 +13,65 @@ enum FilmPipeline {
     private static let library: Data? = libraryURL.flatMap { try? Data(contentsOf: $0) }
     private static let toneKernel = library.flatMap { try? CIColorKernel(functionName: "filmTone", fromMetalLibraryData: $0) }
     private static let grainKernel = library.flatMap { try? CIColorKernel(functionName: "filmGrain", fromMetalLibraryData: $0) }
-    private static let lightKernel = library.flatMap { try? CIColorKernel(functionName: "addLight", fromMetalLibraryData: $0) }
+    private static let sourceKernel = library.flatMap { try? CIColorKernel(functionName: "scatterSource", fromMetalLibraryData: $0) }
     private static let haloKernel = library.flatMap { try? CIColorKernel(functionName: "addHalo", fromMetalLibraryData: $0) }
 
-    // Glow shape: luminance threshold, blur radius (fraction of the long edge), and gain at slider 1.
-    enum HalationTuning { static let threshold: CGFloat = 0.7, radius: CGFloat = 0.006, strength: Float = 1.2 }
-    enum BloomTuning { static let threshold: CGFloat = 0.45, radius: CGFloat = 0.03, strength: Float = 0.5 }
+    // Glow shape: blur radius (fraction of the long edge), the share of each
+    // pixel's light that scatters at slider 1, and how many times over fully
+    // clipped light counts. There's no threshold: scattered light is a small
+    // share of everything, so it only shows where something is far brighter
+    // than its surroundings (lights, glints, a window), as on film. A threshold
+    // can't tell those apart in a RAW decode, where a white wall and a lamp
+    // both sit near 1.0; only the lamp clips in every channel.
+    enum HalationTuning { static let radius: CGFloat = 0.006, amount: Float = 0.12, clipGain: Float = 4 }
+    enum BloomTuning { static let radius: CGFloat = 0.03, amount: Float = 0.1, clipGain: Float = 4 }
 
     /// Long edge, in pixels, that effect sizes are tuned for (full-resolution capture).
     private static let referenceLongEdge: CGFloat = 4000
-    private static let luma = (r: CGFloat(0.2126), g: CGFloat(0.7152), b: CGFloat(0.0722))
+
+    /// The pipeline's steps, so the Lab can switch each off to see what it does.
+    struct Stages: OptionSet, Codable, Hashable {
+        let rawValue: Int
+        static let color = Stages(rawValue: 1 << 0)
+        static let vignette = Stages(rawValue: 1 << 1)
+        static let halation = Stages(rawValue: 1 << 2)
+        static let bloom = Stages(rawValue: 1 << 3)
+        static let tone = Stages(rawValue: 1 << 4)
+        static let grain = Stages(rawValue: 1 << 5)
+        static let all: Stages = [.color, .vignette, .halation, .bloom, .tone, .grain]
+
+        /// In pipeline order, with names for the UI.
+        static let named: [(stage: Stages, name: String)] = [
+            (.color, "Colour"), (.vignette, "Vignette"), (.halation, "Halation"),
+            (.bloom, "Bloom"), (.tone, "Tone"), (.grain, "Grain"),
+        ]
+    }
 
     /// `seed` keeps the grain pattern stable for a given photo.
-    static func apply(_ look: FilmLook, to neutral: CIImage, seed: UInt64 = 0) -> CIImage {
+    static func apply(_ look: FilmLook, to neutral: CIImage, seed: UInt64 = 0, stages: Stages = .all) -> CIImage {
         guard look.strength > 0 else { return neutral }
         let extent = neutral.extent
         let longEdge = max(extent.width, extent.height)
 
-        var image = color(look, neutral)
-        if look.vignette > 0 {
+        var image = stages.contains(.color) ? color(look, neutral) : neutral
+        if look.vignette > 0, stages.contains(.vignette) {
             image = vignette(image, amount: look.vignette)
         }
-        if look.halation > 0 {
+        if look.halation > 0, stages.contains(.halation) {
             // Light scattered back from the film base re-exposes mostly the red
             // layer: a tight red-orange halo around the brightest highlights.
-            image = addGlow(to: image, threshold: HalationTuning.threshold, radius: HalationTuning.radius * longEdge,
-                            tint: (1, 0.3, 0.08), strength: HalationTuning.strength * look.halation, haloOnly: true)
+            image = addGlow(to: image, radius: HalationTuning.radius * longEdge, tint: (1, 0.3, 0.08),
+                            amount: HalationTuning.amount * look.halation, clipGain: HalationTuning.clipGain)
         }
-        if look.bloom > 0 {
+        if look.bloom > 0, stages.contains(.bloom) {
             // Light scattered in the lens and emulsion: a wide, soft, neutral glow.
-            image = addGlow(to: image, threshold: BloomTuning.threshold, radius: BloomTuning.radius * longEdge,
-                            tint: (1, 1, 1), strength: BloomTuning.strength * look.bloom, haloOnly: false)
+            image = addGlow(to: image, radius: BloomTuning.radius * longEdge, tint: (1, 1, 1),
+                            amount: BloomTuning.amount * look.bloom, clipGain: BloomTuning.clipGain)
         }
-        image = tone(look, image)
-        if look.grain > 0 {
+        if stages.contains(.tone) {
+            image = tone(look, image)
+        }
+        if look.grain > 0, stages.contains(.grain) {
             image = grain(image, amount: look.grain, size: look.grainSize, seed: seed)
         }
 
@@ -84,40 +109,20 @@ enum FilmPipeline {
         return filter.outputImage ?? image
     }
 
-    /// Takes the light whose luminance is over `threshold`, tints and blurs it,
-    /// and adds it back. The excess is scaled so a clipped highlight (1.0, as
-    /// a RAW decode delivers blown areas) counts fully, however high the threshold.
-    /// `haloOnly` adds just the light spread past the highlights' edges.
-    private static func addGlow(to image: CIImage, threshold: CGFloat, radius: CGFloat,
-                                tint: (r: CGFloat, g: CGFloat, b: CGFloat), strength: Float, haloOnly: Bool) -> CIImage {
-        guard let lightKernel, let haloKernel else { return image }
+    /// Scatters `amount` of each pixel's light, tinted, over `radius`, and adds
+    /// what spreads past where it came from.
+    private static func addGlow(to image: CIImage, radius: CGFloat, tint: (r: CGFloat, g: CGFloat, b: CGFloat),
+                                amount: Float, clipGain: Float) -> CIImage {
+        guard let sourceKernel, let haloKernel else { return image }
         let extent = image.extent
-
-        // tint × k × (luminance − threshold), with k = strength / (1 − threshold).
         // Alpha stays 1: Core Image filters premultiply their output, so alpha 0 would zero the glow.
-        let k = CGFloat(strength) / (1 - threshold)
-        func row(_ t: CGFloat) -> CIVector { CIVector(x: luma.r * t * k, y: luma.g * t * k, z: luma.b * t * k, w: 0) }
-        let over = CIFilter.colorMatrix()
-        over.inputImage = image
-        over.rVector = row(tint.r)
-        over.gVector = row(tint.g)
-        over.bVector = row(tint.b)
-        over.biasVector = CIVector(x: -tint.r * k * threshold, y: -tint.g * k * threshold, z: -tint.b * k * threshold, w: 0)
-        let clamp = CIFilter.colorClamp()
-        clamp.inputImage = over.outputImage
-        clamp.minComponents = CIVector(x: 0, y: 0, z: 0, w: 0)
-        clamp.maxComponents = CIVector(x: 64, y: 64, z: 64, w: 1)
-
-        guard let source = clamp.outputImage else { return image }
+        guard let source = sourceKernel.apply(extent: extent, arguments: [image, CIVector(x: tint.r, y: tint.g, z: tint.b),
+                                                                          amount, clipGain]) else { return image }
         let glow = source
             .clampedToExtent()
             .applyingGaussianBlur(sigma: Double(radius))
             .cropped(to: extent)
-
-        if haloOnly {
-            return haloKernel.apply(extent: extent, arguments: [image, glow, source]) ?? image
-        }
-        return lightKernel.apply(extent: extent, arguments: [image, glow]) ?? image
+        return haloKernel.apply(extent: extent, arguments: [image, glow, source]) ?? image
     }
 
     private static func tone(_ look: FilmLook, _ image: CIImage) -> CIImage {

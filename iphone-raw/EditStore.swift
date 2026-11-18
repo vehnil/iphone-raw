@@ -1,7 +1,8 @@
 import Observation
 import SwiftUI
 
-/// Development settings for each photo, persisted in an `EditArchive`.
+/// Development settings for each photo, for the gallery's views. A view model
+/// over `EditArchive.shared`, which holds and saves the settings.
 ///
 /// Observed per photo: a view redraws only when the settings of photos it
 /// reads change, so dragging a slider redraws the photo being edited and
@@ -9,14 +10,10 @@ import SwiftUI
 @MainActor
 @Observable
 final class EditStore {
-    @ObservationIgnored private var archive = EditArchive.load()
+    @ObservationIgnored private let archive = EditArchive.shared
     /// Made on first use. Not observed itself; each entry is.
     @ObservationIgnored private var entries: [String: PhotoEntry] = [:]
     @ObservationIgnored private var asShot: [URL: DevelopSettings] = [:]
-    @ObservationIgnored private var pendingSave: Task<Void, Never>?
-    /// Photos changed here since the last save. Only these are written, so the
-    /// store never overwrites entries saved elsewhere (a new capture's crop).
-    @ObservationIgnored private var changed: Set<String> = []
 
     func settings(for url: URL) -> DevelopSettings {
         entry(for: url).settings
@@ -29,10 +26,8 @@ final class EditStore {
     func forget(_ urls: some Collection<URL>) {
         for url in urls {
             entry(for: url).settings = DevelopSettings()
-            archive.photos[url.lastPathComponent] = nil
-            changed.insert(url.lastPathComponent)
+            archive.set(nil, for: url.lastPathComponent)
         }
-        scheduleSave()
     }
 
     /// The camera's white balance with neutral settings. Also fills in the
@@ -53,30 +48,15 @@ final class EditStore {
 
     private func update(_ url: URL, _ settings: DevelopSettings) {
         entry(for: url).settings = settings
-        archive.photos[url.lastPathComponent] = settings
-        changed.insert(url.lastPathComponent)
-        scheduleSave()
+        archive.set(settings, for: url.lastPathComponent)
     }
 
     private func entry(for url: URL) -> PhotoEntry {
         let name = url.lastPathComponent
         if let entry = entries[name] { return entry }
-        let entry = PhotoEntry(settings: archive.photos[name] ?? DevelopSettings())
+        let entry = PhotoEntry(settings: archive.settings(for: name) ?? DevelopSettings())
         entries[name] = entry
         return entry
-    }
-
-    /// Coalesces slider drags into one write.
-    private func scheduleSave() {
-        pendingSave?.cancel()
-        pendingSave = Task { [archive, changed] in
-            try? await Task.sleep(for: .milliseconds(500))
-            guard !Task.isCancelled else { return }
-            EditArchive.update { saved in
-                for name in changed { saved.photos[name] = archive.photos[name] }
-            }
-            self.changed.subtract(changed)
-        }
     }
 }
 

@@ -16,6 +16,7 @@ struct PhotoViewer: View {
     /// Direction the current drag locked to, so one gesture can't both page and open the editor.
     @State private var dragAxis: Axis?
     @State private var isZooming = false
+    @State private var showingLab = false
     @State private var isExporting = false
     @State private var message: String?
 
@@ -77,6 +78,9 @@ struct PhotoViewer: View {
             }
         }
         .navigationTitle(title)
+        .fullScreenCover(isPresented: $showingLab) {
+            LabView(photo: current, edits: edits)
+        }
         .toolbar {
             ToolbarItem(placement: .topBarLeading) {
                 Button(action: onShowGrid) {
@@ -108,6 +112,9 @@ struct PhotoViewer: View {
                     .disabled(isExporting)
                 }
                 Spacer()
+                Button { showingLab = true } label: {
+                    Image(systemName: "flask")
+                }
                 Button { setEditor(!showingEditor) } label: {
                     Image(systemName: "slider.horizontal.3")
                 }

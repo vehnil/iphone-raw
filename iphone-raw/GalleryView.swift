@@ -32,6 +32,7 @@ struct GalleryView: View {
             .navigationBarTitleDisplayMode(.inline)
         }
         .onAppear {
+            RawRenderer.perf.info("gallery: opened")
             library.refresh()
             current = library.photos.last
             RawRenderer.trimThumbnailCache(keeping: library.photos)

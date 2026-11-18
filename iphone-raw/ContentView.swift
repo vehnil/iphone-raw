@@ -58,7 +58,10 @@ struct ContentView: View {
             }
             .foregroundStyle(.white)
         }
-        .task { camera.start() }
+        .task {
+            camera.start()
+            await warmGalleryThumbnails()
+        }
         // The gallery covers the camera without removing it, so stop it explicitly.
         .onChange(of: isCameraShowing) { _, showing in camera.setActive(showing) }
         // Either volume button takes the picture.
@@ -75,6 +78,19 @@ struct ContentView: View {
         .fullScreenCover(isPresented: $showingGallery) {
             GalleryView()
         }
+    }
+
+    /// Readies the gallery's thumbnails while the camera is in use, newest
+    /// first, so opening the gallery doesn't set off a burst of RAW decodes.
+    private func warmGalleryThumbnails() async {
+        // Let the camera start first.
+        try? await Task.sleep(for: .seconds(3))
+        let library = PhotoLibrary()
+        library.refresh()
+        let edits = EditStore()
+        let photos = library.photos.reversed().map { (url: $0, settings: edits.settings(for: $0)) }
+        // About half the memory cache, leaving room for what the gallery asks for itself.
+        await RawRenderer.warmThumbnails(photos, inMemory: 100)
     }
 
     private var isCameraShowing: Bool { !showingGallery && scenePhase != .background }
@@ -202,6 +218,7 @@ struct CameraSettingsView: View {
     @AppStorage(gridKey) private var showsGrid = false
     @AppStorage(levelKey) private var showsLevel = false
     @Environment(\.dismiss) private var dismiss
+    @State private var showingLab = false
 
     var body: some View {
         NavigationStack {
@@ -214,7 +231,13 @@ struct CameraSettingsView: View {
                 }
                 Section {
                     NavigationLink("Lens capabilities") { CapabilitiesView(info: info) }
+                    Button("Film Lab") { showingLab = true }
+                } footer: {
+                    Text("Compare film configurations on test charts. Open it from a photo to test on that photo.")
                 }
+            }
+            .fullScreenCover(isPresented: $showingLab) {
+                LabView(photo: nil, edits: EditStore())
             }
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)
